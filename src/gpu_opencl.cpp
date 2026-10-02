@@ -24,6 +24,8 @@ struct ContextState
     cl_kernel kernel = nullptr;
     cl_mem buf[2] = {nullptr, nullptr};
     size_t size[2] = {0, 0};
+    cl_mem steps = nullptr;
+    int stepCap = 0;
     std::shared_ptr<const Nv12Frame> last[2];
 };
 
@@ -72,7 +74,7 @@ bool ensureKernel(ContextState& st, cl_context ctx, cl_device_id dev, std::strin
 
 } // namespace
 
-bool openclRender(void* queuePtr, const RfParams& p, const std::shared_ptr<const Nv12Frame>& s0,
+bool openclRender(void* queuePtr, const RfParams* p, int n, const std::shared_ptr<const Nv12Frame>& s0,
                   const std::shared_ptr<const Nv12Frame>& s1, void* dst, std::string* err)
 {
     cl_command_queue q = static_cast<cl_command_queue>(queuePtr);
@@ -109,14 +111,27 @@ bool openclRender(void* queuePtr, const RfParams& p, const std::shared_ptr<const
         }
     }
 
+    if (st.stepCap < n)
+    {
+        if (st.steps) clReleaseMemObject(st.steps);
+        st.stepCap = 0;
+        cl_int e;
+        st.steps = clCreateBuffer(ctx, CL_MEM_READ_ONLY, sizeof(RfParams) * n, nullptr, &e);
+        if (!check(e, "clCreateBuffer", err)) { st.steps = nullptr; return false; }
+        st.stepCap = n;
+    }
+    if (!check(clEnqueueWriteBuffer(q, st.steps, CL_TRUE, 0, sizeof(RfParams) * n, p, 0, nullptr, nullptr), "upload params", err))
+        return false;
+
     cl_mem out = static_cast<cl_mem>(dst);
-    cl_int e = clSetKernelArg(st.kernel, 0, sizeof(RfParams), &p);
-    e |= clSetKernelArg(st.kernel, 1, sizeof(cl_mem), &st.buf[0]);
-    e |= clSetKernelArg(st.kernel, 2, sizeof(cl_mem), &st.buf[1]);
-    e |= clSetKernelArg(st.kernel, 3, sizeof(cl_mem), &out);
+    cl_int e = clSetKernelArg(st.kernel, 0, sizeof(cl_mem), &st.steps);
+    e |= clSetKernelArg(st.kernel, 1, sizeof(int), &n);
+    e |= clSetKernelArg(st.kernel, 2, sizeof(cl_mem), &st.buf[0]);
+    e |= clSetKernelArg(st.kernel, 3, sizeof(cl_mem), &st.buf[1]);
+    e |= clSetKernelArg(st.kernel, 4, sizeof(cl_mem), &out);
     if (!check(e, "clSetKernelArg", err)) return false;
     size_t local[2] = {16, 16};
-    size_t global[2] = {size_t((p.outW + 15) / 16 * 16), size_t((p.outH + 15) / 16 * 16)};
+    size_t global[2] = {size_t((p[0].outW + 15) / 16 * 16), size_t((p[0].outH + 15) / 16 * 16)};
     if (!check(clEnqueueNDRangeKernel(q, st.kernel, 2, nullptr, global, local, 0, nullptr, nullptr), "kernel launch", err))
         return false;
     // The source buffers are shared between renders that may use different queues: finish before unlocking.

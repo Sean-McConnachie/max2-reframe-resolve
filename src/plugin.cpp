@@ -11,6 +11,8 @@
 #include <memory>
 #include <vector>
 
+#include <windows.h>
+
 #include "ofxsImageEffect.h"
 
 #include "engine.h"
@@ -24,7 +26,7 @@
     "with gyro stabilization, horizon lock and direction lock."
 #define kPluginIdentifier "com.max2resolve.reframe"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 1
+#define kPluginVersionMinor 2
 
 namespace {
 
@@ -66,6 +68,9 @@ public:
         m_Proj = fetchChoiceParam("proj");
         m_Quality = fetchChoiceParam("quality");
         m_FrameOffset = fetchIntParam("frameOffset");
+        m_MotionBlur = fetchBooleanParam("motionBlur");
+        m_Shutter = fetchDoubleParam("shutter");
+        m_MbSamples = fetchIntParam("mbSamples");
         m_Override = fetchStringParam("sourceOverride");
         m_SrcPath = readSrcPath();
         logf("instance created, source path \"%s\"", m_SrcPath.c_str());
@@ -113,7 +118,6 @@ public:
         int frame = resolveSourceFrame(info, hostFrame) + m_FrameOffset->getValueAtTime(args.time);
         frame = std::clamp(frame, 0, info.frames - 1);
 
-        RenderSettings rs = settings(args.time);
         std::shared_ptr<const Nv12Frame> s0, s1;
         if (!clip->fetch(frame, s0, s1, &err))
         {
@@ -123,29 +127,38 @@ public:
         }
         double decodeMs = msSince(t0);
 
-        ViewParams vp = clip->view(frame, rs);
         // GPU buffers from Resolve are packed rows; fall back to that if the host reports no row bytes.
         int strideFloats = rowBytes > 0 ? rowBytes / int(sizeof(float)) : W * 4;
-        RfParams p = makeRfParams(vp, *s0, W, H, strideFloats);
+        MotionBlurSettings mb;
+        mb.enabled = m_MotionBlur->getValueAtTime(args.time);
+        mb.shutterAngle = m_Shutter->getValueAtTime(args.time);
+        mb.maxSamples = m_MbSamples->getValueAtTime(args.time);
+        double blurPx = 0;
+        std::vector<RfParams> steps = buildRenderSteps(
+            *clip, frame, [&](double dt) { return settings(args.time + dt); }, mb, *s0, W, H, strideFloats, &blurPx);
+        const int n = int(steps.size());
+
         bool ok = true;
-        if (backend == Backend::Cuda) ok = cudaRender(gpuQueue, p, s0, s1, static_cast<float*>(dst->getPixelData()), &err);
-        else if (backend == Backend::OpenCL) ok = openclRender(gpuQueue, p, s0, s1, dst->getPixelData(), &err);
-        else Reprojector(*s0, *s1, vp, W, H).renderAll(static_cast<float*>(dst->getPixelAddress(b.x1, b.y1)), rowBytes / int(sizeof(float)));
+        if (backend == Backend::Cuda) ok = cudaRender(gpuQueue, steps.data(), n, s0, s1, static_cast<float*>(dst->getPixelData()), &err);
+        else if (backend == Backend::OpenCL) ok = openclRender(gpuQueue, steps.data(), n, s0, s1, dst->getPixelData(), &err);
+        else Reprojector(*s0, *s1, steps).renderAll(static_cast<float*>(dst->getPixelAddress(b.x1, b.y1)), rowBytes / int(sizeof(float)));
 
         if (!ok)
         {
             // GPU path failed: render on the CPU and upload the result so the timeline still shows a picture.
             logf("%s render failed (%s), using CPU fallback", backendName(backend), err.c_str());
             std::vector<float> host(size_t(W) * H * 4);
-            Reprojector(*s0, *s1, vp, W, H).renderAll(host.data(), W * 4);
+            for (RfParams& p : steps) p.outStride = W * 4;
+            Reprojector(*s0, *s1, steps).renderAll(host.data(), W * 4);
             if (backend == Backend::Cuda) cudaCopy(gpuQueue, dst->getPixelData(), host.data(), host.size() * sizeof(float), true, &err);
             else openclCopy(gpuQueue, dst->getPixelData(), host.data(), host.size() * sizeof(float), true, &err);
         }
 
         if (shouldLog())
-            logf("render %s t=%.2f srcFrame=%d -> frame %d (got %d/%d), out %dx%d rowBytes %d scale %.3f: decode %.1f ms, total %.1f ms",
+            logf("render %s t=%.2f srcFrame=%d -> frame %d (got %d/%d), out %dx%d rowBytes %d scale %.3f, %d sample(s) "
+                 "(blur %.1f px): decode %.1f ms, total %.1f ms",
                  backendName(backend), args.time, args.srcFrame, frame, s0->index, s1->index, W, H, rowBytes,
-                 args.renderScale.x, decodeMs, msSince(t0));
+                 args.renderScale.x, n, blurPx, decodeMs, msSince(t0));
     }
 
     bool isIdentity(const OFX::IsIdentityArguments&, OFX::Clip*&, double&) override { return false; }
@@ -217,6 +230,9 @@ private:
     OFX::DoubleParam *m_Smooth, *m_Pan, *m_Tilt, *m_Roll, *m_Fov, *m_Curv;
     OFX::ChoiceParam *m_Proj, *m_Quality;
     OFX::IntParam* m_FrameOffset;
+    OFX::BooleanParam* m_MotionBlur;
+    OFX::DoubleParam* m_Shutter;
+    OFX::IntParam* m_MbSamples;
     OFX::StringParam* m_Override;
     std::string m_SrcPath;
 };
@@ -230,6 +246,7 @@ public:
 
     void describe(OFX::ImageEffectDescriptor& d) override
     {
+        logf("describe (v%d.%d)", kPluginVersionMajor, kPluginVersionMinor);
         d.setLabels(kPluginName, kPluginName, kPluginName);
         d.setPluginGrouping(kPluginGrouping);
         d.setPluginDescription(kPluginDescription);
@@ -247,10 +264,12 @@ public:
         d.setSupportsCudaRender(true);
         d.setSupportsCudaStream(true);
         d.setSupportsOpenCLRender(true);
+        logf("describe done");
     }
 
-    void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
+    void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum ctx) override
     {
+        logf("describeInContext %d", int(ctx));
         ClipDescriptor* src = d.defineClip(kOfxImageEffectSimpleSourceClipName);
         src->addSupportedComponent(ePixelComponentRGBA);
         src->setTemporalClipAccess(false);
@@ -266,6 +285,8 @@ public:
         gView->setLabels("View", "View", "View");
         GroupParamDescriptor* gStab = d.defineGroupParam("stabGroup");
         gStab->setLabels("Stabilization", "Stabilization", "Stabilization");
+        GroupParamDescriptor* gMb = d.defineGroupParam("mbGroup");
+        gMb->setLabels("Motion Blur", "Motion Blur", "Motion Blur");
         GroupParamDescriptor* gAdv = d.defineGroupParam("advGroup");
         gAdv->setLabels("Advanced", "Advanced", "Advanced");
         gAdv->setOpen(false);
@@ -321,6 +342,24 @@ public:
                 "Off: the view follows the camera's heading (smoothed)", false, gStab);
         dbl("smooth", "Smoothing", "How smoothly the view follows the camera when Direction Lock is off, seconds", 0.3, 0, 10, 0, 3, gStab);
 
+        boolean("motionBlur", "Motion Blur",
+                "Blur the picture along the virtual camera's movement (pans, tilts, zooms and the smoothed heading "
+                "follow), like a real camera's shutter", false, gMb);
+        dbl("shutter", "Shutter Angle", "Exposure as a fraction of the frame interval: 180 = half the frame (film look), "
+            "360 = the whole frame", 180, 0, 360, 0, 360, gMb);
+        {
+            IntParamDescriptor* p = d.defineIntParam("mbSamples");
+            p->setLabels("Max Samples", "Max Samples", "Max Samples");
+            p->setHint("Upper limit on blur samples per pixel; the plugin uses about one per pixel of blur. "
+                       "Lower is faster, higher is smoother for very fast moves.");
+            p->setDefault(32);
+            p->setRange(2, 128);
+            p->setDisplayRange(2, 64);
+            p->setAnimates(false);
+            p->setParent(*gMb);
+            page->addChild(*p);
+        }
+
         {
             ChoiceParamDescriptor* p = d.defineChoiceParam("quality");
             p->setLabels("Quality", "Quality", "Quality");
@@ -361,6 +400,12 @@ public:
         return new Max2ReframePlugin(handle);
     }
 };
+
+BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH) logf("plugin DLL loaded (pid %lu)", GetCurrentProcessId());
+    return TRUE;
+}
 
 void OFX::Plugin::getPluginIDs(PluginFactoryArray& ids)
 {

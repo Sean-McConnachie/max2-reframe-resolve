@@ -2,6 +2,8 @@
 // The per-pixel math lives in reframe_kernel.h so CPU, CUDA and OpenCL produce identical results.
 #pragma once
 
+#include <vector>
+
 #include "decoder.h"
 #include "mathx.h"
 #include "reframe_kernel.h"
@@ -39,6 +41,8 @@ RfParams makeRfParams(const ViewParams& vp, const Nv12Frame& stream, int outW, i
 class Reprojector
 {
 public:
+    // steps: one parameter set per motion blur time sample (all with the same output size); output is their average.
+    Reprojector(const Nv12Frame& s0, const Nv12Frame& s1, std::vector<RfParams> steps);
     Reprojector(const Nv12Frame& s0, const Nv12Frame& s1, const ViewParams& vp, int fullW, int fullH);
     // Render pixels [x0, x1) of row yTop (0 = top row of the full frame) into dst (RGBA float, 4 per pixel).
     void renderRow(int yTop, int x0, int x1, float* dst) const;
@@ -48,5 +52,5 @@ public:
 private:
     const Nv12Frame& m_S0;
     const Nv12Frame& m_S1;
-    RfParams m_P;
+    std::vector<RfParams> m_Steps;
 };

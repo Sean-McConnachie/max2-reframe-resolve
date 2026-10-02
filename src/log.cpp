@@ -1,6 +1,7 @@
 #include "log.h"
 
 #include <windows.h>
+#include <shlobj.h>
 
 #include <cstdarg>
 #include <cstdio>
@@ -12,12 +13,18 @@ std::mutex g_LogMutex;
 
 std::wstring logPath()
 {
-    wchar_t buf[MAX_PATH];
-    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
-    std::wstring dir = (n && n < MAX_PATH) ? std::wstring(buf) + L"\\Max2Reframe" : L".";
+    // Resolve may run without the usual environment variables, so ask the shell for the folder.
+    std::wstring dir = L".";
+    PWSTR base = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base)))
+    {
+        dir = std::wstring(base) + L"\\Max2Reframe";
+        CoTaskMemFree(base);
+    }
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir + L"\\max2reframe.log";
 }
+
 } // namespace
 
 void logf(const char* fmt, ...)

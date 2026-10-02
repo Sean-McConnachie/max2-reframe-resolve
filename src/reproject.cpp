@@ -52,24 +52,43 @@ RfParams makeRfParams(const ViewParams& vp, const Nv12Frame& stream, int outW, i
     return p;
 }
 
+Reprojector::Reprojector(const Nv12Frame& s0, const Nv12Frame& s1, std::vector<RfParams> steps)
+    : m_S0(s0), m_S1(s1), m_Steps(std::move(steps))
+{
+}
+
 Reprojector::Reprojector(const Nv12Frame& s0, const Nv12Frame& s1, const ViewParams& vp, int fullW, int fullH)
-    : m_S0(s0), m_S1(s1), m_P(makeRfParams(vp, s0, fullW, fullH, fullW * 4))
+    : Reprojector(s0, s1, std::vector<RfParams>{makeRfParams(vp, s0, fullW, fullH, fullW * 4)})
 {
 }
 
 void Reprojector::renderRow(int yTop, int x0, int x1, float* dst) const
 {
-    for (int x = x0; x < x1; ++x, dst += 4) rf_shade(&m_P, m_S0.y(), m_S0.uv(), m_S1.y(), m_S1.uv(), x, yTop, dst);
+    const float inv = 1.0f / float(m_Steps.size());
+    for (int x = x0; x < x1; ++x, dst += 4)
+    {
+        float acc[3] = {0, 0, 0};
+        for (const RfParams& p : m_Steps)
+        {
+            float px[4];
+            rf_shade(&p, m_S0.y(), m_S0.uv(), m_S1.y(), m_S1.uv(), x, yTop, px);
+            acc[0] += px[0]; acc[1] += px[1]; acc[2] += px[2];
+        }
+        dst[0] = acc[0] * inv;
+        dst[1] = acc[1] * inv;
+        dst[2] = acc[2] * inv;
+        dst[3] = 1.0f;
+    }
 }
 
 void Reprojector::renderAll(float* dst, ptrdiff_t rowStride) const
 {
+    const int W = m_Steps[0].outW, H = m_Steps[0].outH;
     unsigned n = std::max(1u, std::thread::hardware_concurrency());
     std::atomic<int> next{0};
     auto work = [&] {
-        for (int r; (r = next.fetch_add(4)) < m_P.outH;)
-            for (int row = r; row < std::min(r + 4, m_P.outH); ++row)
-                renderRow(m_P.outH - 1 - row, 0, m_P.outW, dst + row * rowStride);
+        for (int r; (r = next.fetch_add(4)) < H;)
+            for (int row = r; row < std::min(r + 4, H); ++row) renderRow(H - 1 - row, 0, W, dst + row * rowStride);
     };
     std::vector<std::thread> pool;
     for (unsigned t = 1; t < n; ++t) pool.emplace_back(work);

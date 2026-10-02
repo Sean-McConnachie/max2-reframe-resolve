@@ -42,12 +42,13 @@ struct StabSettings
     }
 };
 
-// Computes, per frame, the rotation mapping output view directions to camera directions.
+// Computes the rotation mapping output view directions to camera directions.
 class Stabilizer
 {
 public:
     explicit Stabilizer(const Source360Info& info);
-    Mat3 rotation(int frame, const StabSettings& s);
+    // subFrame offsets the virtual camera in time (for motion blur); the source frame stays `frame`.
+    Mat3 rotation(int frame, const StabSettings& s, double subFrame = 0);
     bool hasData() const { return !m_T.empty(); }
 
 private:
@@ -57,5 +58,5 @@ private:
     std::vector<Mat3> m_T;     // world0 -> camera
     std::vector<Vec3> m_Grav;  // gravity (up) in world0, per frame
     std::mutex m_Mutex;
-    std::map<StabSettings, std::vector<Mat3>> m_Cache;
+    std::map<StabSettings, std::vector<Mat3>> m_Cache;  // per frame: output view -> world0
 };

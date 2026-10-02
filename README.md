@@ -33,9 +33,13 @@ build.bat
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-`install.ps1` copies the plugin to `%LOCALAPPDATA%\Max2Reframe\OFX` and adds that folder to the user's
-`OFX_PLUGIN_PATH`, so no admin rights are needed. Restart Resolve after installing.
-`install.ps1 -Uninstall` removes it.
+`install.ps1` copies the plugin to `%LOCALAPPDATA%\Max2Reframe\core\Max2ReframeCore.dll`. A small loader in
+Resolve's standard plugin folder (`C:\Program Files\Common Files\OFX\Plugins\Max2Reframe.ofx.bundle`)
+loads it from there. Installing the loader needs admin (one UAC prompt), but updates afterwards don't.
+Restart Resolve after installing. `install.ps1 -Uninstall` removes it.
+
+Resolve doesn't load plugins through a junction, and it doesn't reliably see `OFX_PLUGIN_PATH`, so the loader
+is the dependable way to load the plugin from a folder the user can write to.
 
 ## Use
 
@@ -48,6 +52,10 @@ powershell -ExecutionPolicy Bypass -File install.ps1
      an equidistant fisheye (FOV 360 shows the whole sphere).
    - Pan can be keyframed past ±360 for spins.
    - Set Projection to "Equirectangular 360" to get a stabilized 2:1 360 output.
+4. Optional: turn on Motion Blur. It blurs along the virtual camera's movement during the shutter interval,
+   which comes from keyframed pan/tilt/roll/FOV and the smoothed heading follow. The source frame's pixels
+   stay fixed. Shutter Angle sets the exposure (180 = half the frame). The plugin takes about one sample per
+   pixel of blur, capped by Max Samples (default 32), and uses a single sample when nothing moves.
 
 The log is at `%LOCALAPPDATA%\Max2Reframe\max2reframe.log`.
 

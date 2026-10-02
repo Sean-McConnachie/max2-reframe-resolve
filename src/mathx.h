@@ -69,5 +69,70 @@ struct Mat3
     }
 };
 
+struct Quat
+{
+    double w = 1, x = 0, y = 0, z = 0;
+
+    static Quat fromMat(const Mat3& r)
+    {
+        const auto& m = r.m;
+        Quat q;
+        double t = m[0][0] + m[1][1] + m[2][2];
+        if (t > 0)
+        {
+            double s = std::sqrt(t + 1.0) * 2;
+            q.w = 0.25 * s;
+            q.x = (m[2][1] - m[1][2]) / s;
+            q.y = (m[0][2] - m[2][0]) / s;
+            q.z = (m[1][0] - m[0][1]) / s;
+        }
+        else if (m[0][0] > m[1][1] && m[0][0] > m[2][2])
+        {
+            double s = std::sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2;
+            q.w = (m[2][1] - m[1][2]) / s;
+            q.x = 0.25 * s;
+            q.y = (m[0][1] + m[1][0]) / s;
+            q.z = (m[0][2] + m[2][0]) / s;
+        }
+        else if (m[1][1] > m[2][2])
+        {
+            double s = std::sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2;
+            q.w = (m[0][2] - m[2][0]) / s;
+            q.x = (m[0][1] + m[1][0]) / s;
+            q.y = 0.25 * s;
+            q.z = (m[1][2] + m[2][1]) / s;
+        }
+        else
+        {
+            double s = std::sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2;
+            q.w = (m[1][0] - m[0][1]) / s;
+            q.x = (m[0][2] + m[2][0]) / s;
+            q.y = (m[1][2] + m[2][1]) / s;
+            q.z = 0.25 * s;
+        }
+        return q;
+    }
+    Mat3 toMat() const { return Mat3::fromQuat(w, x, y, z); }
+
+    static Quat slerp(Quat a, Quat b, double t)
+    {
+        double d = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+        if (d < 0) { b.w = -b.w; b.x = -b.x; b.y = -b.y; b.z = -b.z; d = -d; }
+        double ka, kb;
+        if (d > 0.9995) { ka = 1 - t; kb = t; }
+        else
+        {
+            double th = std::acos(d), s = std::sin(th);
+            ka = std::sin((1 - t) * th) / s;
+            kb = std::sin(t * th) / s;
+        }
+        Quat q;
+        q.w = ka * a.w + kb * b.w; q.x = ka * a.x + kb * b.x; q.y = ka * a.y + kb * b.y; q.z = ka * a.z + kb * b.z;
+        double n = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+        q.w /= n; q.x /= n; q.y /= n; q.z /= n;
+        return q;
+    }
+};
+
 constexpr double kPi = 3.14159265358979323846;
 inline double deg2rad(double d) { return d * kPi / 180.0; }

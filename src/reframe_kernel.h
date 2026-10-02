@@ -58,6 +58,7 @@ typedef struct RfParams
     int face, halfW, ovl, mid, right; /* EAC layout */
     int srcW, srcH, srcPitch;        /* NV12 stream size and row pitch (bytes) */
     int uvOffset;                    /* bytes from the Y plane to the interleaved UV plane */
+    float jitterX, jitterY;          /* sub-pixel sample offset (varies per motion blur step) */
 } RfParams;
 
 #define RF_FOUR_OVER_PI 1.27323954f
@@ -196,8 +197,8 @@ RF_FN void rf_shade(const RfParams* p, RF_GLOBAL const rf_uchar* Y0, RF_GLOBAL c
         for (int sx = 0; sx < ss; ++sx)
         {
             float v[3], d[3], rgb[3];
-            float px = (float)x + ((float)sx + 0.5f) / (float)ss;
-            float py = (float)yTop + ((float)sy + 0.5f) / (float)ss;
+            float px = (float)x + ((float)sx + 0.5f) / (float)ss + p->jitterX;
+            float py = (float)yTop + ((float)sy + 0.5f) / (float)ss + p->jitterY;
             if (!rf_view_dir(p, px, py, v)) continue;
             d[0] = p->R[0] * v[0] + p->R[1] * v[1] + p->R[2] * v[2];
             d[1] = p->R[3] * v[0] + p->R[4] * v[1] + p->R[5] * v[2];
@@ -213,15 +214,25 @@ RF_FN void rf_shade(const RfParams* p, RF_GLOBAL const rf_uchar* Y0, RF_GLOBAL c
 }
 
 #if defined(__OPENCL_VERSION__)
-__kernel void ReframeKernel(RfParams p, __global const uchar* Y0, __global const uchar* Y1, __global float* out)
+/* steps: one parameter set per motion blur time sample (n >= 1); the result is their average. */
+__kernel void ReframeKernel(__global const RfParams* steps, int n, __global const uchar* Y0, __global const uchar* Y1,
+                            __global float* out)
 {
     int x = get_global_id(0);
     int y = get_global_id(1);
-    if (x >= p.outW || y >= p.outH) return;
-    float px[4];
-    rf_shade(&p, Y0, Y0 + p.uvOffset, Y1, Y1 + p.uvOffset, x, p.outH - 1 - y, px);
-    __global float* o = out + y * p.outStride + x * 4;
-    o[0] = px[0]; o[1] = px[1]; o[2] = px[2]; o[3] = px[3];
+    int outW = steps[0].outW, outH = steps[0].outH, stride = steps[0].outStride, uvOff = steps[0].uvOffset;
+    if (x >= outW || y >= outH) return;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < n; ++i)
+    {
+        RfParams q = steps[i];
+        float px[4];
+        rf_shade(&q, Y0, Y0 + uvOff, Y1, Y1 + uvOff, x, outH - 1 - y, px);
+        acc[0] += px[0]; acc[1] += px[1]; acc[2] += px[2];
+    }
+    float inv = 1.0f / (float)n;
+    __global float* o = out + y * stride + x * 4;
+    o[0] = acc[0] * inv; o[1] = acc[1] * inv; o[2] = acc[2] * inv; o[3] = 1.0f;
 }
 #endif
 

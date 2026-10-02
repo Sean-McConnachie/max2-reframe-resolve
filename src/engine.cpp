@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <list>
 #include <map>
@@ -115,11 +116,11 @@ bool Clip360::fetch(int frame, std::shared_ptr<const Nv12Frame>& s0, std::shared
     return false;
 }
 
-ViewParams Clip360::view(int frame, const RenderSettings& rs)
+ViewParams Clip360::view(int frame, const RenderSettings& rs, double subFrame)
 {
     ViewParams vp;
     Mat3 user = Mat3::rotY(deg2rad(rs.pan)) * Mat3::rotX(deg2rad(-rs.tilt)) * Mat3::rotZ(deg2rad(-rs.roll));
-    vp.R = m_Stab.rotation(frame, rs.stab) * user;
+    vp.R = m_Stab.rotation(frame, rs.stab, subFrame) * user;
     vp.proj = rs.proj;
     vp.fovH = deg2rad(rs.fovDeg);
     vp.curvature = rs.curvature;
@@ -132,4 +133,68 @@ int resolveSourceFrame(const Source360Info& info, double hostFrame)
     long long f = (long long)std::floor(hostFrame + 0.5);
     if (f >= info.frames && info.tcStartFrame > 0 && f >= info.tcStartFrame) f -= info.tcStartFrame;
     return int(std::clamp<long long>(f, 0, std::max(0, info.frames - 1)));
+}
+
+namespace {
+
+// Longest on-screen distance (pixels) any of a few probe points moves between two views.
+double estimateBlurPx(const RfParams& a, const RfParams& b)
+{
+    const float W = float(a.outW), H = float(a.outH);
+    const float probes[][2] = {{0.5f, 0.5f}, {0.05f, 0.5f}, {0.95f, 0.5f}, {0.5f, 0.05f}, {0.5f, 0.95f},
+                               {0.05f, 0.05f}, {0.95f, 0.05f}, {0.05f, 0.95f}, {0.95f, 0.95f}};
+    // pixels per radian near the centre of the view (every lens is ~equidistant at the centre)
+    double scale = a.proj == 1 ? W / (2 * kPi) : (W * 0.5) / std::max(1e-3, double(a.rhoScale));
+    double worst = 0;
+    for (const auto& pr : probes)
+    {
+        float va[3], vb[3];
+        if (!rf_view_dir(&a, pr[0] * W, pr[1] * H, va) || !rf_view_dir(&b, pr[0] * W, pr[1] * H, vb)) continue;
+        double da[3], db[3];
+        for (int i = 0; i < 3; ++i)
+        {
+            da[i] = a.R[i * 3] * va[0] + a.R[i * 3 + 1] * va[1] + a.R[i * 3 + 2] * va[2];
+            db[i] = b.R[i * 3] * vb[0] + b.R[i * 3 + 1] * vb[1] + b.R[i * 3 + 2] * vb[2];
+        }
+        double d = std::clamp(da[0] * db[0] + da[1] * db[1] + da[2] * db[2], -1.0, 1.0);
+        worst = std::max(worst, std::acos(d));
+    }
+    return worst * scale;
+}
+
+} // namespace
+
+std::vector<RfParams> buildRenderSteps(Clip360& clip, int frame, const std::function<RenderSettings(double)>& settingsAt,
+                                       const MotionBlurSettings& mb, const Nv12Frame& stream, int outW, int outH,
+                                       int outStride, double* blurPx)
+{
+    auto at = [&](double dt) {
+        return makeRfParams(clip.view(frame, settingsAt(dt), dt), stream, outW, outH, outStride);
+    };
+    if (blurPx) *blurPx = 0;
+    double shutter = std::clamp(mb.shutterAngle, 0.0, 360.0) / 360.0;
+    if (!mb.enabled || shutter <= 0) return {at(0)};
+
+    double blur = estimateBlurPx(at(-shutter / 2), at(shutter / 2));
+    if (blurPx) *blurPx = blur;
+    if (blur < 0.5) return {at(0)};
+    int n = std::clamp(int(std::ceil(blur)), 2, std::max(2, mb.maxSamples));
+
+    std::vector<RfParams> steps;
+    steps.reserve(n);
+    for (int k = 0; k < n; ++k)
+    {
+        double dt = ((k + 0.5) / n - 0.5) * shutter;
+        RenderSettings rs = settingsAt(dt);
+        if (n >= 4) rs.supersample = 1;  // the time samples are jittered, so they antialias as well
+        RfParams p = makeRfParams(clip.view(frame, rs, dt), stream, outW, outH, outStride);
+        if (n >= 4)
+        {
+            // R2 low-discrepancy sequence for the sub-pixel jitter
+            p.jitterX = float(std::fmod(0.5 + k * 0.7548776662466927, 1.0) - 0.5);
+            p.jitterY = float(std::fmod(0.5 + k * 0.5698402909980532, 1.0) - 0.5);
+        }
+        steps.push_back(p);
+    }
+    return steps;
 }

@@ -2,6 +2,7 @@
 //   max2render file.360 [--frame N] [--count N] [--out out.ppm] [--w 1920] [--h 1080] [--proj lens|erp]
 //              [--fov 100] [--curv 0.4] [--pan 0] [--tilt 0] [--roll 0] [--stab 1] [--horizon 1] [--dirlock 0]
 //              [--smooth 0.3] [--ss 1] [--gpu cpu|cuda|opencl] [--repeat N] [--dump prefix]
+//              [--mb shutterAngle] [--mbmax 32] [--panrate deg/frame] [--tiltrate deg/frame] [--fovrate deg/frame]
 // With --count > 1 it renders a sequence and reports timing; %d in --out is replaced by the frame number.
 #include <windows.h>
 
@@ -107,6 +108,8 @@ int main(int argc, char** argv)
     std::string out, dump;
     RenderSettings rs;
     GpuTarget gpu;
+    MotionBlurSettings mb;
+    double panRate = 0, tiltRate = 0, fovRate = 0;
     for (int i = 2; i + 1 < argc; i += 2)
     {
         std::string k = argv[i];
@@ -130,6 +133,11 @@ int main(int argc, char** argv)
         else if (k == "--gpu") gpu.kind = v;
         else if (k == "--repeat") repeat = std::max(1, atoi(v));
         else if (k == "--dump") dump = v;
+        else if (k == "--mb") { mb.enabled = true; mb.shutterAngle = atof(v); }
+        else if (k == "--mbmax") mb.maxSamples = atoi(v);
+        else if (k == "--panrate") panRate = atof(v);
+        else if (k == "--tiltrate") tiltRate = atof(v);
+        else if (k == "--fovrate") fovRate = atof(v);
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
     }
 
@@ -166,13 +174,24 @@ int main(int argc, char** argv)
         auto b = std::chrono::steady_clock::now();
         if (!dump.empty()) dumpStreams(dump, *s0, *s1);
         if (s0->index != f || s1->index != f) fprintf(stderr, "frame mismatch: wanted %d got %d/%d\n", f, s0->index, s1->index);
-        ViewParams vp = clip->view(f, rs);
+        // pan/tilt/fov animated linearly in time (for motion blur tests)
+        auto settingsAt = [&](double dt) {
+            RenderSettings r = rs;
+            double t = (f - frame) + dt;
+            r.pan += panRate * t;
+            r.tilt += tiltRate * t;
+            r.fovDeg += fovRate * t;
+            return r;
+        };
+        double blurPx = 0;
+        std::vector<RfParams> steps = buildRenderSteps(*clip, f, settingsAt, mb, *s0, w, h, w * 4, &blurPx);
+        if (mb.enabled && i == 0) printf("motion blur: %.1f px, %zu samples\n", blurPx, steps.size());
         for (int rep = 0; rep < repeat; ++rep)
         {
             bool ok = true;
-            if (gpu.kind == "cuda") ok = cudaRender(gpu.stream, makeRfParams(vp, *s0, w, h, w * 4), s0, s1, gpu.dOut, &err);
-            else if (gpu.kind == "opencl") ok = openclRender(gpu.queue, makeRfParams(vp, *s0, w, h, w * 4), s0, s1, gpu.clOut, &err);
-            else Reprojector(*s0, *s1, vp, w, h).renderAll(img.data(), w * 4);
+            if (gpu.kind == "cuda") ok = cudaRender(gpu.stream, steps.data(), int(steps.size()), s0, s1, gpu.dOut, &err);
+            else if (gpu.kind == "opencl") ok = openclRender(gpu.queue, steps.data(), int(steps.size()), s0, s1, gpu.clOut, &err);
+            else Reprojector(*s0, *s1, steps).renderAll(img.data(), w * 4);
             if (!ok)
             {
                 fprintf(stderr, "%s render failed: %s\n", gpu.kind.c_str(), err.c_str());

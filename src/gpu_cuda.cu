@@ -8,21 +8,32 @@
 
 namespace {
 
-__global__ void ReframeKernel(RfParams p, const unsigned char* Y0, const unsigned char* Y1, float* out)
+// steps: one parameter set per motion blur time sample (n >= 1); the result is their average.
+__global__ void ReframeKernel(const RfParams* steps, int n, const unsigned char* Y0, const unsigned char* Y1, float* out)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= p.outW || y >= p.outH) return;
-    float px[4];
-    rf_shade(&p, Y0, Y0 + p.uvOffset, Y1, Y1 + p.uvOffset, x, p.outH - 1 - y, px);
-    float* o = out + (size_t)y * p.outStride + (size_t)x * 4;
-    o[0] = px[0]; o[1] = px[1]; o[2] = px[2]; o[3] = px[3];
+    const int outW = steps[0].outW, outH = steps[0].outH, uvOff = steps[0].uvOffset;
+    if (x >= outW || y >= outH) return;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
+    for (int i = 0; i < n; ++i)
+    {
+        RfParams q = steps[i];
+        float px[4];
+        rf_shade(&q, Y0, Y0 + uvOff, Y1, Y1 + uvOff, x, outH - 1 - y, px);
+        acc0 += px[0]; acc1 += px[1]; acc2 += px[2];
+    }
+    const float inv = 1.0f / (float)n;
+    float* o = out + (size_t)y * steps[0].outStride + (size_t)x * 4;
+    o[0] = acc0 * inv; o[1] = acc1 * inv; o[2] = acc2 * inv; o[3] = 1.0f;
 }
 
 struct DeviceState
 {
     unsigned char* buf[2] = {nullptr, nullptr};
     size_t size[2] = {0, 0};
+    RfParams* steps = nullptr;
+    int stepCap = 0;
     std::shared_ptr<const Nv12Frame> last[2];  // frames currently on the device (kept alive so pointers stay unique)
 };
 
@@ -38,7 +49,7 @@ bool check(cudaError_t e, const char* what, std::string* err)
 
 } // namespace
 
-bool cudaRender(void* streamPtr, const RfParams& p, const std::shared_ptr<const Nv12Frame>& s0,
+bool cudaRender(void* streamPtr, const RfParams* p, int n, const std::shared_ptr<const Nv12Frame>& s0,
                 const std::shared_ptr<const Nv12Frame>& s1, float* dst, std::string* err)
 {
     cudaStream_t stream = static_cast<cudaStream_t>(streamPtr);
@@ -68,9 +79,19 @@ bool cudaRender(void* streamPtr, const RfParams& p, const std::shared_ptr<const 
             st.last[i] = *frames[i];
         }
     }
+    if (st.stepCap < n)
+    {
+        if (st.steps) cudaFree(st.steps);
+        st.steps = nullptr;
+        st.stepCap = 0;
+        if (!check(cudaMalloc(&st.steps, sizeof(RfParams) * n), "cudaMalloc", err)) return false;
+        st.stepCap = n;
+    }
+    if (!check(cudaMemcpyAsync(st.steps, p, sizeof(RfParams) * n, cudaMemcpyHostToDevice, stream), "upload params", err))
+        return false;
     dim3 threads(16, 16, 1);
-    dim3 blocks((p.outW + 15) / 16, (p.outH + 15) / 16, 1);
-    ReframeKernel<<<blocks, threads, 0, stream>>>(p, st.buf[0], st.buf[1], dst);
+    dim3 blocks((p[0].outW + 15) / 16, (p[0].outH + 15) / 16, 1);
+    ReframeKernel<<<blocks, threads, 0, stream>>>(st.steps, n, st.buf[0], st.buf[1], dst);
     if (!check(cudaGetLastError(), "kernel launch", err)) return false;
     // The device buffers are shared between renders that may use different streams: finish before unlocking.
     return check(cudaStreamSynchronize(stream), "kernel", err);

@@ -246,14 +246,26 @@ const std::vector<Mat3>& Stabilizer::table(const StabSettings& s)
         if (z.norm() < 1e-6) z = Vec3(0, 0, 1) - u * u.z;  // looking straight up/down: pick any forward
         z = z.normalized();
         Vec3 x = u.cross(z);
-        out[i] = m_T[i] * Mat3::cols(x, u, z);
+        out[i] = Mat3::cols(x, u, z);  // output view -> world0
     }
     return m_Cache.emplace(s, std::move(out)).first->second;
 }
 
-Mat3 Stabilizer::rotation(int frame, const StabSettings& s)
+Mat3 Stabilizer::rotation(int frame, const StabSettings& s, double subFrame)
 {
     if (!s.stabilize || m_T.empty()) return Mat3::identity();
-    const auto& t = table(s);
-    return t[std::clamp(frame, 0, int(t.size()) - 1)];
+    const auto& e = table(s);
+    int n = int(e.size());
+    frame = std::clamp(frame, 0, n - 1);
+    // The pixels come from `frame`, so the camera orientation is that frame's; only the virtual (output)
+    // camera moves within the shutter interval.
+    Mat3 view = e[frame];
+    if (subFrame != 0)
+    {
+        double t = std::clamp(frame + subFrame, 0.0, double(n - 1));
+        int a = int(std::floor(t));
+        int b = std::min(a + 1, n - 1);
+        view = Quat::slerp(Quat::fromMat(e[a]), Quat::fromMat(e[b]), t - a).toMat();
+    }
+    return m_T[frame] * view;
 }
