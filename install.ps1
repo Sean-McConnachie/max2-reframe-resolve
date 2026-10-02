@@ -4,6 +4,7 @@
 #  - A tiny loader goes into Resolve's standard plugin folder,
 #    C:\Program Files\Common Files\OFX\Plugins\Max2Reframe.ofx.bundle, and forwards to the core. Installing or
 #    changing the loader needs admin (one UAC prompt); it rarely changes.
+#  - The "Import GoPro 360" script goes into Resolve's Scripts menu (Workspace > Scripts).
 # Restart Resolve afterwards. Uninstall: .\install.ps1 -Uninstall
 param([switch]$Uninstall)
 $ErrorActionPreference = 'Stop'
@@ -14,6 +15,8 @@ $core = Join-Path $coreDir 'Max2ReframeCore.dll'
 $bundle = 'C:\Program Files\Common Files\OFX\Plugins\Max2Reframe.ofx.bundle'
 $stub = Join-Path $bundle 'Contents\Win64\Max2Reframe.ofx'
 $builtStub = Join-Path $PSScriptRoot 'build\Max2Reframe.ofx.bundle\Contents\Win64\Max2Reframe.ofx'
+$scriptDir = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility'
+$importScript = 'Import GoPro 360.py'
 
 function Remove-Locked($path) {
     # A running Resolve keeps DLLs locked; a locked file can still be renamed out of the way.
@@ -40,6 +43,7 @@ $isJunction = (Test-Path $bundle) -and ((Get-Item $bundle -Force).Attributes -ba
 
 if ($Uninstall) {
     Remove-Locked $core
+    Remove-Item (Join-Path $scriptDir $importScript) -ErrorAction SilentlyContinue
     if (Test-Path $bundle) { Invoke-Elevated "rmdir /s /q `"$bundle`"" | Out-Null }
     Write-Host "Uninstalled. Restart DaVinci Resolve."
     return
@@ -66,6 +70,9 @@ if ($needStub) {
         throw "Could not install the loader (is Resolve still running?)"
     }
 }
+
+New-Item -ItemType Directory -Force $scriptDir | Out-Null
+Copy-Item (Join-Path $PSScriptRoot "tools\resolve\$importScript") (Join-Path $scriptDir $importScript) -Force
 
 # Resolve remembers plugins that failed to load and will not retry them; drop our entries so it rescans.
 $cache = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml'

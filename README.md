@@ -43,8 +43,11 @@ is the dependable way to load the plugin from a folder the user can write to.
 
 ## Use
 
-1. Import the `.360` files into Resolve. If Resolve refuses the `.360` extension, run
-   `tools\link-mp4.ps1 <folder>`. It creates `NAME.360.mp4` hard links, which use no extra disk space.
+1. Import the `.360` files with **Workspace → Scripts → Import GoPro 360** and pick a folder. Resolve won't
+   import the `.360` extension, so the script gives every `.360` under that folder a hard-linked `.mp4`
+   name: the same file, using no extra space, in a hidden `_Max2Reframe` subfolder. It imports those into
+   the current bin, named after the original files. Running it again on the same folder reuses the existing
+   links. (`tools\link-mp4.ps1 <folder>` does the linking without importing.)
 2. Put a clip on the timeline. Then go to Effects → OpenFX → GoPro 360 → **Max2 Reframe** and drag it onto
    the clip.
 3. Set Pan / Tilt / Roll / Field of View (all keyframeable), and Stabilize / Horizon Lock / Direction Lock.
