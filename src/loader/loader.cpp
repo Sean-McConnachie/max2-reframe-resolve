@@ -1,7 +1,6 @@
 // Tiny OFX loader installed once into Resolve's standard plugin folder (needs admin).
 // It forwards to the real plugin in %LOCALAPPDATA%\Max2Reframe\core\Max2ReframeCore.dll, so updating the plugin
-// never needs admin rights. (Resolve neither follows a junction into the plugin folder nor reliably sees
-// OFX_PLUGIN_PATH, so this is the dependable way to load from a user-writable location.)
+// never needs admin rights.
 #include <windows.h>
 #include <shlobj.h>
 

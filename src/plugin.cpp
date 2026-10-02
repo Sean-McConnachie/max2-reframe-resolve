@@ -246,7 +246,8 @@ public:
 
     void describe(OFX::ImageEffectDescriptor& d) override
     {
-        logf("describe (v%d.%d)", kPluginVersionMajor, kPluginVersionMinor);
+        // No logging from DllMain: it runs under the loader lock, where shell calls (the log path) can fail.
+        logf("plugin loaded, describe (v%d.%d, pid %lu)", kPluginVersionMajor, kPluginVersionMinor, GetCurrentProcessId());
         d.setLabels(kPluginName, kPluginName, kPluginName);
         d.setPluginGrouping(kPluginGrouping);
         d.setPluginDescription(kPluginDescription);
@@ -401,14 +402,9 @@ public:
     }
 };
 
-BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
-{
-    if (reason == DLL_PROCESS_ATTACH) logf("plugin DLL loaded (pid %lu)", GetCurrentProcessId());
-    return TRUE;
-}
-
 void OFX::Plugin::getPluginIDs(PluginFactoryArray& ids)
 {
+    logf("getPluginIDs (pid %lu)", GetCurrentProcessId());
     static Max2ReframeFactory factory;
     ids.push_back(&factory);
 }

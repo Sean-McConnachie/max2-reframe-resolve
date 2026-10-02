@@ -3,3 +3,4 @@ work/
 data/
 __pycache__/
 *.obj
+dist/

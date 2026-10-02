@@ -14,9 +14,24 @@ $coreDir = Join-Path $base 'core'
 $core = Join-Path $coreDir 'Max2ReframeCore.dll'
 $bundle = 'C:\Program Files\Common Files\OFX\Plugins\Max2Reframe.ofx.bundle'
 $stub = Join-Path $bundle 'Contents\Win64\Max2Reframe.ofx'
-$builtStub = Join-Path $PSScriptRoot 'build\Max2Reframe.ofx.bundle\Contents\Win64\Max2Reframe.ofx'
 $scriptDir = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility'
 $importScript = 'Import GoPro 360.py'
+
+# Files come from a release zip (next to this script) or from a source checkout (build\ and tools\resolve\).
+if (Test-Path (Join-Path $PSScriptRoot 'Max2ReframeCore.dll')) {
+    $srcCore = Join-Path $PSScriptRoot 'Max2ReframeCore.dll'
+    $builtStub = Join-Path $PSScriptRoot 'Max2Reframe.ofx.bundle\Contents\Win64\Max2Reframe.ofx'
+    $srcScript = Join-Path $PSScriptRoot $importScript
+} else {
+    $srcCore = Join-Path $PSScriptRoot 'build\Max2ReframeCore.dll'
+    $builtStub = Join-Path $PSScriptRoot 'build\Max2Reframe.ofx.bundle\Contents\Win64\Max2Reframe.ofx'
+    $srcScript = Join-Path $PSScriptRoot "tools\resolve\$importScript"
+}
+
+# Resolve keeps its plugin cache in memory and rewrites it on exit, so changes made while it runs are lost.
+if (Get-Process Resolve -ErrorAction SilentlyContinue) {
+    throw "Close DaVinci Resolve, then run the installer again."
+}
 
 function Remove-Locked($path) {
     # A running Resolve keeps DLLs locked; a locked file can still be renamed out of the way.
@@ -52,7 +67,7 @@ if ($Uninstall) {
 New-Item -ItemType Directory -Force $coreDir | Out-Null
 Get-ChildItem $coreDir -Filter '*.old*' | ForEach-Object { try { Remove-Item $_.FullName -Force } catch {} }
 Remove-Locked $core
-Copy-Item (Join-Path $PSScriptRoot 'build\Max2ReframeCore.dll') $core
+Copy-Item $srcCore $core
 
 function Get-LoaderVersion($path) {
     $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($path))
@@ -72,7 +87,7 @@ if ($needStub) {
 }
 
 New-Item -ItemType Directory -Force $scriptDir | Out-Null
-Copy-Item (Join-Path $PSScriptRoot "tools\resolve\$importScript") (Join-Path $scriptDir $importScript) -Force
+Copy-Item $srcScript (Join-Path $scriptDir $importScript) -Force
 
 # Resolve remembers plugins that failed to load and will not retry them; drop our entries so it rescans.
 $cache = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml'
