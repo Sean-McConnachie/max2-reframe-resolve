@@ -5,175 +5,157 @@ Resolve will not import files with the .360 extension, so this script gives each
 .mp4 (an NTFS hard link: same file, no extra disk space) in a hidden "_Max2Reframe" subfolder next to it, and imports
 those into the current Media Pool bin. Clips are renamed back to the original file name.
 
+Resolve runs menu scripts in a restricted Lua: there is no require (so no ffi) and no io. This script uses only
+bmd.*, fu:RequestDir and os.execute (cmd's mklink).
+
 Progress and errors go to the Console (Workspace > Console) and to
 %APPDATA%\Blackmagic Design\DaVinci Resolve\Support\logs\Max2Reframe-import.log.
 
-Written in Lua because Resolve always includes LuaJIT. Test outside Resolve (linking only):
+Test outside Resolve (linking only):
   set MAX2_TEST_DIR=D:\some\folder
   "C:\Program Files\Blackmagic Design\DaVinci Resolve\fuscript.exe" -l lua "Import GoPro 360.lua"
 ]]
 
 local LINK_DIR = "_Max2Reframe"
--- next to Resolve's own logs
-local logDir = os.getenv("APPDATA") and (os.getenv("APPDATA") .. "\\Blackmagic Design\\DaVinci Resolve\\Support\\logs")
-local logPath = (logDir or os.getenv("TEMP") or "C:\\Windows\\Temp") .. "\\Max2Reframe-import.log"
+local appData = os.getenv("APPDATA") or ""
+local supportDir = appData .. [[\Blackmagic Design\DaVinci Resolve\Support]]
+local logPath = supportDir .. [[\logs\Max2Reframe-import.log]]
+local settingsPath = supportDir .. [[\Max2Reframe-import.settings]]
 
+local logLines = {}
 local function log(msg)
-    msg = "Import GoPro 360: " .. tostring(msg)
-    print(msg)
-    local f = io.open(logPath, "a")
-    if f then
-        f:write(os.date("%Y-%m-%d %H:%M:%S "), msg, "\n")
-        f:close()
+    msg = tostring(msg)
+    print("Import GoPro 360: " .. msg)
+    logLines[#logLines + 1] = os.date("%Y-%m-%d %H:%M:%S ") .. msg
+    pcall(bmd.writefile, logPath, {Log = logLines})
+end
+
+local function join(a, b)
+    if a:sub(-1) == "\\" or a:sub(-1) == "/" then return a .. b end
+    return a .. "\\" .. b
+end
+
+local function entries(dir)
+    local out = {}
+    for _, e in ipairs(bmd.readdir(join(dir, "*")) or {}) do
+        if e.Name ~= "." and e.Name ~= ".." then out[#out + 1] = e end
     end
+    return out
+end
+
+local function find360(dir, found)
+    for _, e in ipairs(entries(dir)) do
+        local path = join(dir, e.Name)
+        if e.IsDir then
+            if e.Name ~= LINK_DIR then find360(path, found) end
+        elseif e.Name:lower():sub(-4) == ".360" then
+            found[#found + 1] = {path = path, dir = dir, name = e.Name, size = e.Size}
+        end
+    end
+    return found
+end
+
+local function sizeOf(dir, name)
+    for _, e in ipairs(entries(dir)) do
+        if e.Name:lower() == name:lower() then return e.Size end
+    end
+    return nil
+end
+
+-- Run cmd commands joined with "&", in batches that stay under cmd's 8191 character line limit.
+local function runCmds(cmds)
+    local batch, len = {}, 0
+    local function flush()
+        if #batch > 0 then os.execute(table.concat(batch, " & ")) end
+        batch, len = {}, 0
+    end
+    for _, c in ipairs(cmds) do
+        if len + #c + 3 > 7000 then flush() end
+        batch[#batch + 1] = c
+        len = len + #c + 3
+    end
+    flush()
+end
+
+-- Make the .mp4 hard links for a list of .360 files. Returns the links and the failures.
+local function linkAll(files)
+    local links, failed, cmds, todo = {}, {}, {}, {}
+    local hidden = {}
+    for _, f in ipairs(files) do
+        if sizeOf(f.dir, f.name .. ".mp4") == f.size then
+            -- a link made by tools\link-mp4.ps1 next to the file
+            f.link = join(f.dir, f.name .. ".mp4")
+        else
+            local linkDir = join(f.dir, LINK_DIR)
+            f.link = join(linkDir, f.name .. ".mp4")
+            local existing = bmd.direxists(linkDir) and sizeOf(linkDir, f.name .. ".mp4")
+            if existing ~= f.size then
+                if not bmd.direxists(linkDir) then
+                    bmd.createdir(linkDir)
+                    if not hidden[linkDir] then
+                        hidden[linkDir] = true
+                        cmds[#cmds + 1] = 'attrib +h "' .. linkDir .. '"'
+                    end
+                end
+                if existing then cmds[#cmds + 1] = 'del /f /q "' .. f.link .. '"' end -- the .360 was replaced
+                cmds[#cmds + 1] = 'mklink /H "' .. f.link .. '" "' .. f.path .. '" >nul'
+                todo[#todo + 1] = f
+            end
+        end
+    end
+    if #cmds > 0 then runCmds(cmds) end
+    for _, f in ipairs(files) do
+        local dir, name = f.link:match("^(.*)\\([^\\]*)$")
+        if sizeOf(dir, name) == f.size then links[#links + 1] = f
+        else failed[#failed + 1] = f.path end
+    end
+    return links, failed
+end
+
+local function lastFolder()
+    local ok, t = pcall(bmd.readfile, settingsPath)
+    return ok and type(t) == "table" and t.LastFolder or nil
 end
 
 local function main()
-    local ffi = require("ffi")
-    -- Resolve may run every script in the same Lua state, so declarations from an earlier run can still exist:
-    -- declare each one separately and ignore "attempt to redefine".
-    local decls = {
-        "int MultiByteToWideChar(unsigned int cp, unsigned long flags, const char* s, int n, wchar_t* w, int wn);",
-        "int WideCharToMultiByte(unsigned int cp, unsigned long flags, const wchar_t* w, int wn, char* s, int n, const char* d, int* u);",
-        "int CreateHardLinkW(const wchar_t* link, const wchar_t* target, void* sa);",
-        "int CreateDirectoryW(const wchar_t* path, void* sa);",
-        "int SetFileAttributesW(const wchar_t* path, unsigned long attrs);",
-        "int DeleteFileW(const wchar_t* path);",
-        "unsigned long GetLastError(void);",
-        "typedef struct { void* hwndOwner; void* pidlRoot; wchar_t* pszDisplayName; const wchar_t* lpszTitle;"
-            .. " unsigned int ulFlags; void* lpfn; intptr_t lParam; int iImage; } MAX2_BROWSEINFOW;",
-        "void* SHBrowseForFolderW(MAX2_BROWSEINFOW* bi);",
-        "int SHGetPathFromIDListW(void* pidl, wchar_t* path);",
-        "long CoInitializeEx(void* reserved, unsigned long coinit);",
-        "void CoTaskMemFree(void* p);",
-        "void* GetForegroundWindow(void);",
-    }
-    for _, d in ipairs(decls) do pcall(ffi.cdef, d) end
-    local k32, shell32, ole32, user32 = ffi.load("kernel32"), ffi.load("shell32"), ffi.load("ole32"), ffi.load("user32")
-
-    local function wide(s)
-        local n = k32.MultiByteToWideChar(65001, 0, s, -1, nil, 0)
-        local buf = ffi.new("wchar_t[?]", n)
-        k32.MultiByteToWideChar(65001, 0, s, -1, buf, n)
-        return buf
-    end
-
-    local function utf8(w)
-        local n = k32.WideCharToMultiByte(65001, 0, w, -1, nil, 0, nil, nil)
-        local buf = ffi.new("char[?]", n)
-        k32.WideCharToMultiByte(65001, 0, w, -1, buf, n, nil, nil)
-        return ffi.string(buf)
-    end
-
-    -- Windows folder browser (Fusion's RequestDir does not open from the Edit page). Returns nil on cancel.
-    local function pickFolder(title)
-        ole32.CoInitializeEx(nil, 0x2) -- apartment threaded; harmless if COM is already initialised
-        local name = ffi.new("wchar_t[260]")
-        local bi = ffi.new("MAX2_BROWSEINFOW")
-        bi.hwndOwner = user32.GetForegroundWindow()
-        bi.pszDisplayName = name
-        local t = wide(title)
-        bi.lpszTitle = t
-        bi.ulFlags = 0x1 + 0x40 + 0x200 -- file system folders only, new dialog style, no "new folder" button
-        local pidl = shell32.SHBrowseForFolderW(bi)
-        if pidl == nil then return nil end
-        local path = ffi.new("wchar_t[32768]")
-        local ok = shell32.SHGetPathFromIDListW(pidl, path) ~= 0
-        ole32.CoTaskMemFree(pidl)
-        return ok and utf8(path) or nil
-    end
-
-    local function join(a, b)
-        if a:sub(-1) == "\\" or a:sub(-1) == "/" then return a .. b end
-        return a .. "\\" .. b
-    end
-
-    local function entries(dir)
-        local out = {}
-        for _, e in ipairs(bmd.readdir(join(dir, "*")) or {}) do
-            if e.Name ~= "." and e.Name ~= ".." then out[#out + 1] = e end
-        end
-        return out
-    end
-
-    local function find360(dir, found)
-        for _, e in ipairs(entries(dir)) do
-            local path = join(dir, e.Name)
-            if e.IsDir then
-                if e.Name ~= LINK_DIR then find360(path, found) end
-            elseif e.Name:lower():sub(-4) == ".360" then
-                found[#found + 1] = {path = path, dir = dir, name = e.Name, size = e.Size}
-            end
-        end
-        return found
-    end
-
-    local function sizeOf(dir, name)
-        for _, e in ipairs(entries(dir)) do
-            if e.Name:lower() == name:lower() then return e.Size end
-        end
-        return nil
-    end
-
-    -- Create (if needed) and return the .mp4 hard link for a .360 file, or nil and an error.
-    local function linkFor(f)
-        -- links made by tools\link-mp4.ps1 sit next to the file; reuse those
-        if sizeOf(f.dir, f.name .. ".mp4") == f.size then return join(f.dir, f.name .. ".mp4") end
-        local linkDir = join(f.dir, LINK_DIR)
-        if not bmd.fileexists(linkDir) then
-            k32.CreateDirectoryW(wide(linkDir), nil)
-            k32.SetFileAttributesW(wide(linkDir), 0x2) -- hidden
-        end
-        local link = join(linkDir, f.name .. ".mp4")
-        local existing = sizeOf(linkDir, f.name .. ".mp4")
-        if existing == f.size then return link end
-        if existing then k32.DeleteFileW(wide(link)) end -- stale: the .360 was replaced since
-        if k32.CreateHardLinkW(wide(link), wide(f.path), nil) == 0 then
-            return nil, "Windows error " .. tostring(k32.GetLastError())
-        end
-        return link
-    end
-
-    local function linkAll(folder)
-        local files = find360(folder, {})
-        local links, failed = {}, {}
-        for _, f in ipairs(files) do
-            local link, err = linkFor(f)
-            if link then links[#links + 1] = {link = link, name = f.name}
-            else failed[#failed + 1] = f.path .. " (" .. err .. ")" end
-        end
-        return files, links, failed
-    end
+    log("started")
 
     -- Test mode outside Resolve
     local testDir = os.getenv("MAX2_TEST_DIR")
     if testDir and not resolve then
-        local files, links, failed = linkAll(testDir)
+        local files = find360(testDir, {})
+        local links, failed = linkAll(files)
         log(#files .. " .360 file(s), " .. #links .. " link(s)")
-        for _, l in ipairs(links) do log("  " .. l.link) end
-        for _, f in ipairs(failed) do log("  failed: " .. f) end
+        for _, f in ipairs(links) do log("  " .. f.link) end
+        for _, p in ipairs(failed) do log("  failed: " .. p) end
         return
     end
 
-    log("started")
-    local res = resolve or (bmd and bmd.scriptapp and bmd.scriptapp("Resolve"))
+    local res = resolve or (bmd.scriptapp and bmd.scriptapp("Resolve"))
     if not res then log("could not connect to Resolve") return end
     local project = res:GetProjectManager():GetCurrentProject()
     if not project then log("open a project first") return end
+    if type(os.execute) ~= "function" then log("this Resolve version does not allow os.execute, so links cannot be made") return end
 
+    local fusionApp = fu or fusion or res:Fusion()
+    if not fusionApp then log("could not get the Fusion object for the folder browser") return end
     log("opening the folder browser")
-    local folder = pickFolder("Select the folder with your .360 files. Subfolders are included.")
+    local folder = fusionApp:RequestDir(lastFolder() or "", {FReqS_Title = "Select the folder with your .360 files"})
     if not folder or folder == "" then log("no folder selected") return end
-    log("scanning " .. folder)
+    folder = folder:gsub("/", "\\")
+    pcall(bmd.writefile, settingsPath, {LastFolder = folder})
+    log("scanning " .. folder .. " and its subfolders")
 
-    local files, links, failed = linkAll(folder)
-    for _, f in ipairs(failed) do log("could not link: " .. f) end
+    local files = find360(folder, {})
     if #files == 0 then log("no .360 files in " .. folder) return end
+    local links, failed = linkAll(files)
+    for _, p in ipairs(failed) do log("could not make a link for " .. p .. " (is the drive NTFS?)") end
+    if #links == 0 then return end
 
     local paths, names = {}, {}
-    for i, l in ipairs(links) do
-        paths[i] = l.link
-        names[l.link:lower()] = l.name
+    for i, f in ipairs(links) do
+        paths[i] = f.link
+        names[f.link:lower()] = f.name
     end
     local items = project:GetMediaPool():ImportMedia(paths) or {}
     local count = 0
