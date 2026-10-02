@@ -15,7 +15,7 @@ $core = Join-Path $coreDir 'Max2ReframeCore.dll'
 $bundle = 'C:\Program Files\Common Files\OFX\Plugins\Max2Reframe.ofx.bundle'
 $stub = Join-Path $bundle 'Contents\Win64\Max2Reframe.ofx'
 $scriptDir = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility'
-$importScript = 'Import GoPro 360.py'
+$importScript = 'Import GoPro 360.lua'
 
 # Files come from a release zip (next to this script) or from a source checkout (build\ and tools\resolve\).
 if (Test-Path (Join-Path $PSScriptRoot 'Max2ReframeCore.dll')) {
@@ -58,7 +58,7 @@ $isJunction = (Test-Path $bundle) -and ((Get-Item $bundle -Force).Attributes -ba
 
 if ($Uninstall) {
     Remove-Locked $core
-    Remove-Item (Join-Path $scriptDir $importScript) -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $scriptDir $importScript), (Join-Path $scriptDir 'Import GoPro 360.py') -ErrorAction SilentlyContinue
     if (Test-Path $bundle) { Invoke-Elevated "rmdir /s /q `"$bundle`"" | Out-Null }
     Write-Host "Uninstalled. Restart DaVinci Resolve."
     return
@@ -87,6 +87,7 @@ if ($needStub) {
 }
 
 New-Item -ItemType Directory -Force $scriptDir | Out-Null
+Remove-Item (Join-Path $scriptDir 'Import GoPro 360.py') -ErrorAction SilentlyContinue  # replaced by the Lua version
 Copy-Item $srcScript (Join-Path $scriptDir $importScript) -Force
 
 # Resolve remembers plugins that failed to load and will not retry them; drop our entries so it rescans.
