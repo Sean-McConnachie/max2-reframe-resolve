@@ -53,7 +53,7 @@ On an RTX 3060 laptop GPU, one UHD frame takes approximately 8 ms to render with
 5. When Windows asks for administrator permission, click **Yes**.
 6. Start DaVinci Resolve.
 
-The installer puts a small loader in `C:\Program Files\Common Files\OFX\Plugins`. Only this step needs administrator permission. The plugin itself goes into `%LOCALAPPDATA%\Max2Reframe`. Updates replace only this folder.
+The installer puts a small loader in `C:\Program Files\Common Files\OFX\Plugins`. Only this step needs administrator permission. The plugin itself goes into `%LOCALAPPDATA%\Max2Reframe`. Updates replace only this folder. The installer also adds **Prepare GoPro 360 for Resolve** to the Explorer menu of folders and drives, and two scripts to the Resolve **Workspace > Scripts** menu.
 
 If Windows SmartScreen stops `Install.bat`, click **More info**, then click **Run anyway**.
 
@@ -61,15 +61,40 @@ To remove the plugin, close Resolve and double-click `Uninstall.bat`.
 
 ## Use
 
-1. In Resolve, open your project.
-2. Select **Workspace > Scripts > Import GoPro 360**.
-3. Select the folder with your `.360` files. The script imports all `.360` files in the folder and its subfolders.
-4. Put a clip on the timeline.
-5. In the Effects panel, open **OpenFX > GoPro 360**.
-6. Drag **Max2 Reframe** onto the clip.
-7. In the Inspector, set the view and the stabilization.
+### Prepare the folder
 
-Resolve does not import files with the `.360` extension. The script gives each `.360` file a second name that ends in `.mp4`. This second name is an NTFS hard link, so it uses no disk space. The links are in a hidden `_Max2Reframe` folder next to your files.
+Resolve does not import files with the `.360` extension. A script in Resolve 21.1 Free cannot make files, so you prepare the folder in Explorer first.
+
+1. In Explorer, right-click the folder with your `.360` files. On Windows 11, then select **Show more options**.
+2. Select **Prepare GoPro 360 for Resolve**.
+3. Read the message, then click **OK**.
+
+The tool examines the folder and all its subfolders. It gives each `.360` file a second name that ends in `.mp4`, and it uses no disk space for this:
+
+- On an NTFS drive, the second name is a hard link in a hidden `_Max2Reframe` folder next to the file.
+- On an exFAT or FAT32 drive, for example most SD cards and many external drives, Windows cannot make hard links. The second name is then a symbolic link in `%LOCALAPPDATA%\Max2Reframe\links`. If Developer Mode is off in Windows, Windows asks for administrator permission to make these links.
+
+Each folder with `.360` files also gets a hidden `_Max2Reframe` folder with a list of the links. After you add `.360` files to the folder, prepare it again. If an external drive gets a different drive letter, prepare the folder again.
+
+### Import the clips
+
+1. In Resolve, open your project.
+2. In the Media Pool, select the bin for the clips.
+3. Select **Workspace > Scripts**, then select one of these scripts:
+   - **Import GoPro 360** imports the `.360` files of one folder into the bin. It does not import the subfolders.
+   - **Import GoPro 360 Folder Tree** imports a folder and its subfolders. It makes a bin for each folder, so the bins have the same structure as the folders.
+4. Select the prepared folder, then click **Select Folder**.
+
+The scripts give each clip the name of its `.360` file. They do not import a clip again if it is already in the bin.
+
+A `.360` file has two sound streams: stereo sound and 4-channel ambisonic (360-degree) sound. Resolve shows them as five audio tracks. The scripts keep only the stereo track. If you changed the audio of a clip in **Clip Attributes**, the scripts do not change it.
+
+### Reframe a clip
+
+1. Put a clip on the timeline.
+2. In the Effects panel, open **OpenFX > GoPro 360**.
+3. Drag **Max2 Reframe** onto the clip.
+4. In the Inspector, set the view and the stabilization.
 
 ## Settings
 
@@ -94,8 +119,11 @@ Resolve does not import files with the `.360` extension. The script gives each `
 ## Troubleshooting
 
 - **The plugin is not in the Effects panel.** Close Resolve and run `Install.bat` again. The installer also clears the plugin cache of Resolve.
-- **The picture is the original clip, not the reframed view.** The clip is not a `.360` file. Import it with the **Import GoPro 360** script.
-- **The Import GoPro 360 script does not import the clips.** Open **Workspace > Console** and read the messages. The script also writes a log file at `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Max2Reframe\import.log`.
+- **The picture is the original clip, not the reframed view.** The clip is not a `.360` file. Import it with an **Import GoPro 360** script.
+- **Prepare GoPro 360 for Resolve is not in the Explorer menu.** Run `Install.bat` again. On Windows 11, select **Show more options** first.
+- **The folder dialog opens again with "Not prepared" in its title.** Prepare the folder in Explorer, then select it again in the dialog.
+- **The Prepare message says that Windows did not allow the symbolic links.** Click **Yes** in the permission prompt. Or turn on Developer Mode in Windows Settings (**For developers**). Then prepare the folder again.
+- **The script does not import the clips.** A script in Resolve Free cannot show messages. The scripts write their messages to `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\logs\ResolveDebug.txt`.
 - **Other problems.** Read the log file at `%LOCALAPPDATA%\Max2Reframe\max2reframe.log`.
 
 ## Build from source
@@ -106,7 +134,7 @@ You need Visual Studio 2022 with the C++ tools and the CUDA Toolkit 12.
 2. Close DaVinci Resolve.
 3. Run `powershell -ExecutionPolicy Bypass -File install.ps1`.
 
-`tools\package.ps1` makes the release zip in `dist\`. `build\max2render.exe` renders frames without Resolve. The comment at the top of `tools\max2render.cpp` lists its options.
+`build.bat` also makes `build\Max2Prepare.exe` from `tools\prepare360.cpp`. `tools\package.ps1` makes the release zip in `dist\`. `build\max2render.exe` renders frames without Resolve. The comment at the top of `tools\max2render.cpp` lists its options.
 
 ## How it works
 

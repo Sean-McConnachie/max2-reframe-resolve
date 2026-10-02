@@ -1,5 +1,5 @@
 @echo off
-rem Builds the OFX plugin bundle and the max2render test tool into build\
+rem Builds the OFX plugin bundle, the Max2Prepare Explorer tool and the max2render test tool into build\
 setlocal
 cd /d "%~dp0"
 if not defined VCINSTALLDIR call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
@@ -41,4 +41,6 @@ set BUNDLE=%OUT%\Max2Reframe.ofx.bundle\Contents\Win64
 if not exist %BUNDLE% mkdir %BUNDLE%
 cl %CFLAGS% /c src\loader\loader.cpp /Fo%OBJ%\loader.obj || exit /b 1
 link /nologo /DLL /OUT:%BUNDLE%\Max2Reframe.ofx %OBJ%\loader.obj shell32.lib ole32.lib || exit /b 1
-echo Built %OUT%\Max2ReframeCore.dll and %BUNDLE%\Max2Reframe.ofx
+rem "Prepare GoPro 360 for Resolve" in the Explorer folder menu (a window app, so no console flashes)
+cl %CFLAGS% /DUNICODE /D_UNICODE tools\prepare360.cpp /Fo%OBJ%\ /Fe%OUT%\Max2Prepare.exe /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib ole32.lib advapi32.lib || exit /b 1
+echo Built %OUT%\Max2ReframeCore.dll, %BUNDLE%\Max2Reframe.ofx and %OUT%\Max2Prepare.exe

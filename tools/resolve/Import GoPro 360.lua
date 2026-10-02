@@ -1,115 +1,116 @@
 --[[
 DaVinci Resolve script: Workspace > Scripts > Import GoPro 360
+Imports the .360 files of one folder (not its subfolders) into the current Media Pool bin.
 
-Resolve will not import files with the .360 extension, so each .360 file gets a second name ending in .mp4 (an NTFS
-hard link: same file, no extra disk space) in a hidden "_Max2Reframe" subfolder next to it. This script imports
-those links into the current Media Pool bin and renames the clips back to the original file names.
+Resolve does not import files with the .360 extension, and in Resolve 21.1 Free a menu script cannot create files or
+start programs. So first, in Explorer, right-click the folder > "Prepare GoPro 360 for Resolve" (Max2Prepare.exe).
+That makes an .mp4 link for each .360 file and a files.lua list in a hidden "_Max2Reframe" folder. This script
+reads the list, imports the links and names the clips after the .360 files. Clips that are already in the bin
+are skipped, so the script can run again after more files are added and prepared.
 
-Resolve runs menu scripts in a restricted Lua: no require, io or os.execute, and Fusion's folder dialog does not
-open from the Edit page. So the folder dialog and the links come from "Import GoPro 360.ps1" in
-%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Max2Reframe. This script starts it through
-"Import GoPro 360.cmd" (bmd.openfileexternal) and waits for its result.txt. The helper logs to import.log there.
-
-Failures are raised as Lua errors, so they also appear in Resolve's own log (Support\logs\ResolveDebug.txt).
-
-Test outside Resolve (no dialog, no import):
-  set MAX2_TEST_DIR=D:\some\folder
-  "C:\Program Files\Blackmagic Design\DaVinci Resolve\fuscript.exe" -l lua "Import GoPro 360.lua"
+A script cannot show a message box either, so messages appear as the title of the folder dialog. Details go to
+%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\logs\ResolveDebug.txt.
 ]]
 
-local helperDir = (os.getenv("APPDATA") or "") .. [[\Blackmagic Design\DaVinci Resolve\Support\Max2Reframe]]
-local launcher = helperDir .. [[\Import GoPro 360.cmd]]
-local resultPath = helperDir .. [[\result.txt]]
-local START_TIMEOUT = 30 -- seconds for the helper to start
-local PICK_TIMEOUT = 3600 -- seconds to pick a folder and make the links
+local TITLE = "Import GoPro 360"
+local LINK_DIR = [[\_Max2Reframe\]]
 
-local function log(msg) print("Import GoPro 360: " .. tostring(msg)) end
+local function log(msg) (printerr or print)(TITLE .. ": " .. msg) end
 
--- Names the functions this Resolve version gives scripts, for the error message.
-local function capabilities()
-    local names = {}
-    for _, n in ipairs({"openfileexternal", "readfile", "fileexists", "wait", "readdir"}) do
-        names[#names + 1] = "bmd." .. n .. "=" .. type(bmd and bmd[n])
+-- The folder from the dialog, without the trailing backslash ("D:\" becomes "D:"). nil if cancelled.
+local function pickFolder(title, start)
+    local dir = fusion:RequestDir(start, { FReqS_Title = title })
+    if type(dir) ~= "string" or dir == "" then return nil end
+    return (dir:gsub("[\\/]+$", ""))
+end
+
+-- Names of the prepared .360 files in dir, or nil if the folder was not prepared.
+local function preparedFiles(dir)
+    local path = dir .. LINK_DIR .. "files.lua"
+    if not bmd.fileexists(path) then return nil end
+    local ok, names = pcall(dofile, path)
+    if not ok or type(names) ~= "table" then
+        log("cannot read " .. path .. ": " .. tostring(names))
+        return nil
     end
-    names[#names + 1] = "os.time=" .. type(os and os.time)
-    return table.concat(names, " ")
+    return names
 end
 
-local function fail(msg) error("Import GoPro 360: " .. msg .. " [" .. capabilities() .. "]", 0) end
-
-local function readResult()
-    local ok, r = pcall(bmd.readfile, resultPath)
-    if ok and type(r) == "table" then return r end
-    return nil
+-- A Max 2 file has a stereo AAC stream and a 4-channel ambisonic stream, which Resolve shows as 1 stereo and 4 mono
+-- audio tracks. Keep only the stereo track, unless someone changed the clip's audio mapping by hand.
+local STEREO_ONLY = '{"track_mapping":{"1":{"channel_idx":[1,2],"mute":false,"type":"stereo"}}}'
+local function keepStereo(item)
+    local ok, mapping = pcall(function() return item:GetAudioMapping() end)
+    if not ok or type(mapping) ~= "string" then return end
+    local _, tracks = mapping:gsub('"type"', "")
+    if tracks == 5 and mapping:find('"1":{"channel_idx":[1,2]', 1, true) then
+        if not item:SetAudioMapping(STEREO_ONLY) then log("cannot set the audio of " .. item:GetName()) end
+    end
 end
 
-local function sleep(seconds)
-    if bmd.wait then bmd.wait(seconds) return end
-    local t = os.clock() + seconds
-    while os.clock() < t do end
+-- Imports the prepared files of dir into bin. Returns the number imported and the number already there.
+local function importFolder(mediaPool, bin, dir, names)
+    local have = {}
+    for _, clip in ipairs(bin:GetClipList() or {}) do
+        local p = clip:GetClipProperty("File Path")
+        if type(p) == "string" then have[p:lower()] = clip end
+    end
+    local paths, nameOf, already = {}, {}, 0
+    for _, entry in ipairs(names) do
+        local name = entry.Name
+        -- a symbolic link elsewhere (drives without hard links), or a hard link in the _Max2Reframe folder
+        local link = entry.Link or (dir .. LINK_DIR .. name .. ".mp4")
+        if have[link:lower()] then
+            already = already + 1
+            keepStereo(have[link:lower()]) -- clips imported by an earlier version of this script
+        elseif bmd.fileexists(link) then
+            paths[#paths + 1] = link
+            nameOf[link:lower()] = name
+        else
+            log("missing " .. link .. ". Prepare the folder again.")
+        end
+    end
+    if #paths == 0 then return 0, already end
+    mediaPool:SetCurrentFolder(bin)
+    local count = 0
+    for _, item in ipairs(mediaPool:ImportMedia(paths) or {}) do
+        count = count + 1
+        local p = item:GetClipProperty("File Path")
+        local name = type(p) == "string" and nameOf[p:lower()]
+        if name and not (item.SetName and item:SetName(name)) then item:SetClipProperty("Clip Name", name) end
+        keepStereo(item)
+    end
+    if count < #paths then log("Resolve imported " .. count .. " of " .. #paths .. " files from " .. dir) end
+    return count, already
 end
 
 local function main()
-    log("started")
-    for _, n in ipairs({"openfileexternal", "readfile", "fileexists"}) do
-        if type(bmd[n]) ~= "function" then fail("bmd." .. n .. " is not available in this version of Resolve") end
-    end
-    if not bmd.fileexists(launcher) then fail("missing " .. launcher .. ". Run Install.bat again.") end
+    local project = resolve:GetProjectManager():GetCurrentProject()
+    if not project then return log("open a project first") end
+    local mediaPool = project:GetMediaPool()
+    local bin = mediaPool:GetCurrentFolder()
 
-    local testDir = os.getenv("MAX2_TEST_DIR")
-    local res = resolve or (bmd.scriptapp and bmd.scriptapp("Resolve"))
-    local project = res and res:GetProjectManager():GetCurrentProject()
-    if not testDir then
-        if not res then fail("could not connect to Resolve") end
-        if not project then fail("open a project first") end
-    end
-
-    local before = readResult()
-    local oldToken = before and before.Token
-    log("opening the folder dialog")
-    pcall(bmd.openfileexternal, "Open", launcher)
-
-    -- The helper writes result.txt with a new token as soon as it starts, then again when it is done.
-    local r
-    local waited = 0
+    local title = TITLE .. ": select a folder with .360 files (prepared in Explorer)"
+    local start = fusion:GetData("Max2Reframe.LastFolder")
     while true do
-        sleep(0.25)
-        waited = waited + 0.25
-        r = readResult()
-        local started = r and r.Token ~= oldToken
-        if started and r.Status ~= "running" then break end
-        if not started and waited > START_TIMEOUT then
-            fail("the helper did not start. See " .. helperDir .. [[\import.log]])
+        local dir = pickFolder(title, start)
+        if not dir then return end
+        start = dir
+        fusion:SetData("Max2Reframe.LastFolder", dir)
+        local names = preparedFiles(dir)
+        if not names or #names == 0 then
+            title = "Not prepared: in Explorer, right-click the folder > Prepare GoPro 360 for Resolve. Then select it again."
+        else
+            local count, already = importFolder(mediaPool, bin, dir, names)
+            log("imported " .. count .. " clip(s) from " .. dir .. ", " .. already .. " already in the bin")
+            if count > 0 then return end
+            if already > 0 then
+                title = "All " .. already .. " clips of this folder are already in the bin. Select another folder or Cancel."
+            else
+                title = "Resolve imported none of the files. Prepare the folder again in Explorer, then select it."
+            end
         end
-        if waited > PICK_TIMEOUT then fail("no folder was selected within " .. PICK_TIMEOUT .. " seconds") end
     end
-
-    for _, e in ipairs(r.Errors or {}) do log("error: " .. e) end
-    if r.Status == "cancelled" then log("no folder selected") return end
-    if r.Status == "none" then log("no .360 files in " .. r.Folder) return end
-    if r.Status ~= "ok" then fail(table.concat(r.Errors or {}, "; ")) end
-
-    local paths, names = {}, {}
-    for i, l in ipairs(r.Links or {}) do
-        paths[i] = l.Path
-        names[l.Path:lower()] = l.Name
-    end
-    if testDir then
-        for _, p in ipairs(paths) do log("  " .. p) end
-        return
-    end
-    if #paths == 0 then fail("no links could be made in " .. r.Folder .. " (is the drive NTFS?)") end
-
-    local items = project:GetMediaPool():ImportMedia(paths) or {}
-    local count = 0
-    for _, item in pairs(items) do
-        count = count + 1
-        local path = item:GetClipProperty("File Path")
-        local name = path and names[path:lower()]
-        if name then pcall(function() item:SetClipProperty("Clip Name", name) end) end
-    end
-    log("imported " .. count .. " of " .. #paths .. " .360 file(s) from " .. r.Folder)
-    if count == 0 then fail("Resolve imported none of the " .. #paths .. " links in " .. r.Folder) end
 end
 
 main()
