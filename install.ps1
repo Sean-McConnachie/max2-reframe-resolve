@@ -4,7 +4,8 @@
 #  - A tiny loader goes into Resolve's standard plugin folder,
 #    C:\Program Files\Common Files\OFX\Plugins\Max2Reframe.ofx.bundle, and forwards to the core. Installing or
 #    changing the loader needs admin (one UAC prompt); it rarely changes.
-#  - The "Import GoPro 360" script goes into Resolve's Scripts menu (Workspace > Scripts).
+#  - The "Import GoPro 360" script goes into Resolve's Scripts menu (Workspace > Scripts), and its PowerShell
+#    helper into %APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Max2Reframe.
 # Restart Resolve afterwards. Uninstall: .\install.ps1 -Uninstall
 param([switch]$Uninstall)
 $ErrorActionPreference = 'Stop'
@@ -16,12 +17,15 @@ $bundle = 'C:\Program Files\Common Files\OFX\Plugins\Max2Reframe.ofx.bundle'
 $stub = Join-Path $bundle 'Contents\Win64\Max2Reframe.ofx'
 $scriptDir = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility'
 $importScript = 'Import GoPro 360.lua'
+$helperName = 'Import GoPro 360.ps1'
+$helperDir = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\Max2Reframe'
 
 # Files come from a release zip (next to this script) or from a source checkout (build\ and tools\resolve\).
 if (Test-Path (Join-Path $PSScriptRoot 'Max2ReframeCore.dll')) {
     $srcCore = Join-Path $PSScriptRoot 'Max2ReframeCore.dll'
     $builtStub = Join-Path $PSScriptRoot 'Max2Reframe.ofx.bundle\Contents\Win64\Max2Reframe.ofx'
     $srcScript = Join-Path $PSScriptRoot $importScript
+    $srcHelper = Join-Path $PSScriptRoot $helperName
 } else {
     $srcCore = Join-Path $PSScriptRoot 'build\Max2ReframeCore.dll'
     $builtStub = Join-Path $PSScriptRoot 'build\Max2Reframe.ofx.bundle\Contents\Win64\Max2Reframe.ofx'
@@ -59,6 +63,7 @@ $isJunction = (Test-Path $bundle) -and ((Get-Item $bundle -Force).Attributes -ba
 if ($Uninstall) {
     Remove-Locked $core
     Remove-Item (Join-Path $scriptDir $importScript), (Join-Path $scriptDir 'Import GoPro 360.py') -ErrorAction SilentlyContinue
+    Remove-Item $helperDir -Recurse -Force -ErrorAction SilentlyContinue
     if (Test-Path $bundle) { Invoke-Elevated "rmdir /s /q `"$bundle`"" | Out-Null }
     Write-Host "Uninstalled. Restart DaVinci Resolve."
     return
@@ -89,6 +94,9 @@ if ($needStub) {
 New-Item -ItemType Directory -Force $scriptDir | Out-Null
 Remove-Item (Join-Path $scriptDir 'Import GoPro 360.py') -ErrorAction SilentlyContinue  # replaced by the Lua version
 Copy-Item $srcScript (Join-Path $scriptDir $importScript) -Force
+# Resolve's script Lua cannot show a folder dialog or make links, so a PowerShell helper does both.
+New-Item -ItemType Directory -Force $helperDir | Out-Null
+Copy-Item $srcHelper (Join-Path $helperDir $helperName) -Force
 
 # Resolve remembers plugins that failed to load and will not retry them; drop our entries so it rescans.
 $cache = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml'

@@ -95,6 +95,7 @@ Resolve does not import files with the `.360` extension. The script gives each `
 
 - **The plugin is not in the Effects panel.** Close Resolve and run `Install.bat` again. The installer also clears the plugin cache of Resolve.
 - **The picture is the original clip, not the reframed view.** The clip is not a `.360` file. Import it with the **Import GoPro 360** script.
+- **The Import GoPro 360 script does not import the clips.** Open **Workspace > Console** and read the messages. The script also writes a log file at `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Max2Reframe\import.log`.
 - **Other problems.** Read the log file at `%LOCALAPPDATA%\Max2Reframe\max2reframe.log`.
 
 ## Build from source
