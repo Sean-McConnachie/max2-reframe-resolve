@@ -3,16 +3,18 @@
 // Resolve hands OFX effects images at timeline resolution, so instead of using the input image this plugin
 // reads the clip's source path (kOfxImageEffectPropSrcFilePath) and decodes the .360 itself at full
 // resolution. The input image is only used as a pass-through when the source is not a .360 file.
+// Rendering runs on CUDA or OpenCL (whichever Resolve is using), with a CPU fallback.
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
+#include <vector>
 
 #include "ofxsImageEffect.h"
-#include "ofxsMultiThread.h"
-#include "ofxsProcessing.h"
 
 #include "engine.h"
+#include "gpu.h"
 #include "log.h"
 
 #define kPluginName "Max2 Reframe"
@@ -22,59 +24,26 @@
     "with gyro stabilization, horizon lock and direction lock."
 #define kPluginIdentifier "com.max2resolve.reframe"
 #define kPluginVersionMajor 1
-#define kPluginVersionMinor 0
+#define kPluginVersionMinor 1
 
 namespace {
 
-class ReframeProcessor : public OFX::ImageProcessor
+std::atomic<int> g_RenderCount{0};
+
+bool shouldLog()
 {
-public:
-    ReframeProcessor(OFX::ImageEffect& effect, const Reprojector& rp, const OfxRectI& bounds)
-        : OFX::ImageProcessor(effect), m_Rp(rp), m_Bounds(bounds)
-    {
-    }
+    int n = g_RenderCount++;
+    return n < 30 || n % 300 == 0;
+}
 
-    void multiThreadProcessImages(OfxRectI win) override
-    {
-        for (int y = win.y1; y < win.y2; ++y)
-        {
-            if (_effect.abort()) break;
-            float* d = static_cast<float*>(_dstImg->getPixelAddress(win.x1, y));
-            if (!d) continue;
-            int yTop = m_Bounds.y2 - 1 - y;  // OFX rows go bottom-up
-            m_Rp.renderRow(yTop, win.x1 - m_Bounds.x1, win.x2 - m_Bounds.x1, d);
-        }
-    }
-
-private:
-    const Reprojector& m_Rp;
-    OfxRectI m_Bounds;
-};
-
-class CopyProcessor : public OFX::ImageProcessor
+double msSince(std::chrono::steady_clock::time_point t)
 {
-public:
-    CopyProcessor(OFX::ImageEffect& effect, OFX::Image* src) : OFX::ImageProcessor(effect), m_Src(src) {}
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
 
-    void multiThreadProcessImages(OfxRectI win) override
-    {
-        for (int y = win.y1; y < win.y2; ++y)
-        {
-            float* d = static_cast<float*>(_dstImg->getPixelAddress(win.x1, y));
-            for (int x = win.x1; x < win.x2; ++x, d += 4)
-            {
-                const float* s = m_Src ? static_cast<const float*>(m_Src->getPixelAddress(x, y)) : nullptr;
-                if (s) std::memcpy(d, s, 4 * sizeof(float));
-                else d[0] = d[1] = d[2] = d[3] = 0;
-            }
-        }
-    }
+enum class Backend { Cpu, Cuda, OpenCL };
 
-private:
-    OFX::Image* m_Src;
-};
-
-std::atomic<int> g_RenderLogBudget{40};
+const char* backendName(Backend b) { return b == Backend::Cuda ? "CUDA" : b == Backend::OpenCL ? "OpenCL" : "CPU"; }
 
 } // namespace
 
@@ -104,9 +73,16 @@ public:
 
     void render(const OFX::RenderArguments& args) override
     {
+        auto t0 = std::chrono::steady_clock::now();
+        Backend backend = args.isEnabledCudaRender ? Backend::Cuda : args.isEnabledOpenCLRender ? Backend::OpenCL : Backend::Cpu;
+        void* gpuQueue = backend == Backend::Cuda ? args.pCudaStream : args.pOpenCLCmdQ;
+
         std::unique_ptr<OFX::Image> dst(m_Dst->fetchImage(args.time));
         if (!dst || dst->getPixelDepth() != OFX::eBitDepthFloat || dst->getPixelComponents() != OFX::ePixelComponentRGBA)
             OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+        const OfxRectI b = dst->getBounds();
+        const int W = b.x2 - b.x1, H = b.y2 - b.y1;
+        int rowBytes = dst->getRowBytes();
 
         std::string path;
         m_Override->getValue(path);
@@ -125,10 +101,10 @@ public:
         std::shared_ptr<Clip360> clip = path.empty() ? nullptr : Clip360::open(utf8ToWide(path), &err);
         if (!clip)
         {
-            if (g_RenderLogBudget-- > 0)
+            if (shouldLog())
                 logf("render t=%.2f: no usable .360 source (\"%s\": %s), passing input through", args.time, path.c_str(),
                      path.empty() ? "host gave no source path" : err.c_str());
-            passThrough(args, dst.get());
+            passThrough(args, dst.get(), backend, gpuQueue);
             return;
         }
 
@@ -137,47 +113,64 @@ public:
         int frame = resolveSourceFrame(info, hostFrame) + m_FrameOffset->getValueAtTime(args.time);
         frame = std::clamp(frame, 0, info.frames - 1);
 
-        RenderSettings rs;
-        rs.stab.stabilize = m_Stabilize->getValueAtTime(args.time);
-        rs.stab.horizon = m_Horizon->getValueAtTime(args.time);
-        rs.stab.directionLock = m_DirLock->getValueAtTime(args.time);
-        rs.stab.smoothSeconds = m_Smooth->getValueAtTime(args.time);
-        rs.pan = m_Pan->getValueAtTime(args.time);
-        rs.tilt = m_Tilt->getValueAtTime(args.time);
-        rs.roll = m_Roll->getValueAtTime(args.time);
-        rs.fovDeg = m_Fov->getValueAtTime(args.time);
-        rs.curvature = m_Curv->getValueAtTime(args.time);
-        int proj = 0, quality = 0;
-        m_Proj->getValueAtTime(args.time, proj);
-        m_Quality->getValueAtTime(args.time, quality);
-        rs.proj = proj == 1 ? Projection::Equirectangular : Projection::Lens;
-        rs.supersample = quality == 1 ? 2 : 1;
-
+        RenderSettings rs = settings(args.time);
         std::shared_ptr<const Nv12Frame> s0, s1;
         if (!clip->fetch(frame, s0, s1, &err))
         {
             logf("render t=%.2f frame %d: decode failed: %s", args.time, frame, err.c_str());
-            passThrough(args, dst.get());
+            passThrough(args, dst.get(), backend, gpuQueue);
             return;
         }
+        double decodeMs = msSince(t0);
 
-        OfxRectI b = dst->getBounds();
-        if (g_RenderLogBudget-- > 0)
-            logf("render t=%.2f srcFrame=%d -> frame %d (got %d/%d), out %dx%d window %d,%d-%d,%d scale %.3f draft=%d",
-                 args.time, args.srcFrame, frame, s0->index, s1->index, b.x2 - b.x1, b.y2 - b.y1, args.renderWindow.x1,
-                 args.renderWindow.y1, args.renderWindow.x2, args.renderWindow.y2, args.renderScale.x,
-                 int(args.renderQualityDraft));
+        ViewParams vp = clip->view(frame, rs);
+        // GPU buffers from Resolve are packed rows; fall back to that if the host reports no row bytes.
+        int strideFloats = rowBytes > 0 ? rowBytes / int(sizeof(float)) : W * 4;
+        RfParams p = makeRfParams(vp, *s0, W, H, strideFloats);
+        bool ok = true;
+        if (backend == Backend::Cuda) ok = cudaRender(gpuQueue, p, s0, s1, static_cast<float*>(dst->getPixelData()), &err);
+        else if (backend == Backend::OpenCL) ok = openclRender(gpuQueue, p, s0, s1, dst->getPixelData(), &err);
+        else Reprojector(*s0, *s1, vp, W, H).renderAll(static_cast<float*>(dst->getPixelAddress(b.x1, b.y1)), rowBytes / int(sizeof(float)));
 
-        Reprojector rp(*s0, *s1, clip->view(frame, rs), b.x2 - b.x1, b.y2 - b.y1);
-        ReframeProcessor proc(*this, rp, b);
-        proc.setDstImg(dst.get());
-        proc.setRenderWindow(args.renderWindow);
-        proc.process();
+        if (!ok)
+        {
+            // GPU path failed: render on the CPU and upload the result so the timeline still shows a picture.
+            logf("%s render failed (%s), using CPU fallback", backendName(backend), err.c_str());
+            std::vector<float> host(size_t(W) * H * 4);
+            Reprojector(*s0, *s1, vp, W, H).renderAll(host.data(), W * 4);
+            if (backend == Backend::Cuda) cudaCopy(gpuQueue, dst->getPixelData(), host.data(), host.size() * sizeof(float), true, &err);
+            else openclCopy(gpuQueue, dst->getPixelData(), host.data(), host.size() * sizeof(float), true, &err);
+        }
+
+        if (shouldLog())
+            logf("render %s t=%.2f srcFrame=%d -> frame %d (got %d/%d), out %dx%d rowBytes %d scale %.3f: decode %.1f ms, total %.1f ms",
+                 backendName(backend), args.time, args.srcFrame, frame, s0->index, s1->index, W, H, rowBytes,
+                 args.renderScale.x, decodeMs, msSince(t0));
     }
 
     bool isIdentity(const OFX::IsIdentityArguments&, OFX::Clip*&, double&) override { return false; }
 
 private:
+    RenderSettings settings(double t)
+    {
+        RenderSettings rs;
+        rs.stab.stabilize = m_Stabilize->getValueAtTime(t);
+        rs.stab.horizon = m_Horizon->getValueAtTime(t);
+        rs.stab.directionLock = m_DirLock->getValueAtTime(t);
+        rs.stab.smoothSeconds = m_Smooth->getValueAtTime(t);
+        rs.pan = m_Pan->getValueAtTime(t);
+        rs.tilt = m_Tilt->getValueAtTime(t);
+        rs.roll = m_Roll->getValueAtTime(t);
+        rs.fovDeg = m_Fov->getValueAtTime(t);
+        rs.curvature = m_Curv->getValueAtTime(t);
+        int proj = 0, quality = 0;
+        m_Proj->getValueAtTime(t, proj);
+        m_Quality->getValueAtTime(t, quality);
+        rs.proj = proj == 1 ? Projection::Equirectangular : Projection::Lens;
+        rs.supersample = quality == 1 ? 2 : 1;
+        return rs;
+    }
+
     std::string readSrcPath()
     {
         try
@@ -190,13 +183,32 @@ private:
         }
     }
 
-    void passThrough(const OFX::RenderArguments& args, OFX::Image* dst)
+    void passThrough(const OFX::RenderArguments& args, OFX::Image* dst, Backend backend, void* queue)
     {
         std::unique_ptr<OFX::Image> src(m_Src && m_Src->isConnected() ? m_Src->fetchImage(args.time) : nullptr);
-        CopyProcessor proc(*this, src.get());
-        proc.setDstImg(dst);
-        proc.setRenderWindow(args.renderWindow);
-        proc.process();
+        const OfxRectI b = dst->getBounds();
+        if (backend != Backend::Cpu)
+        {
+            size_t bytes = size_t(b.x2 - b.x1) * (b.y2 - b.y1) * 4 * sizeof(float);
+            std::string err;
+            if (src && src->getBounds().x2 == b.x2 && src->getBounds().y2 == b.y2)
+            {
+                bool ok = backend == Backend::Cuda ? cudaCopy(queue, dst->getPixelData(), src->getPixelData(), bytes, false, &err)
+                                                   : openclCopy(queue, dst->getPixelData(), src->getPixelData(), bytes, false, &err);
+                if (!ok) logf("pass-through copy failed: %s", err.c_str());
+            }
+            return;
+        }
+        for (int y = b.y1; y < b.y2; ++y)
+        {
+            float* d = static_cast<float*>(dst->getPixelAddress(b.x1, y));
+            for (int x = b.x1; x < b.x2; ++x, d += 4)
+            {
+                const float* s = src ? static_cast<const float*>(src->getPixelAddress(x, y)) : nullptr;
+                if (s) std::memcpy(d, s, 4 * sizeof(float));
+                else d[0] = d[1] = d[2] = d[3] = 0;
+            }
+        }
     }
 
     OFX::Clip* m_Dst;
@@ -232,6 +244,9 @@ public:
         d.setRenderTwiceAlways(false);
         d.setSupportsMultipleClipPARs(false);
         d.setRenderThreadSafety(eRenderInstanceSafe);
+        d.setSupportsCudaRender(true);
+        d.setSupportsCudaStream(true);
+        d.setSupportsOpenCLRender(true);
     }
 
     void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
@@ -280,11 +295,13 @@ public:
             return p;
         };
 
-        dbl("pan", "Pan", "Look left (-) / right (+), degrees", 0, -3600, 3600, -180, 180, gView);
-        dbl("tilt", "Tilt", "Look down (-) / up (+), degrees", 0, -90, 90, -90, 90, gView);
-        dbl("roll", "Roll", "Rotate the view, degrees", 0, -180, 180, -45, 45, gView);
-        dbl("fov", "Field of View", "Horizontal field of view, degrees", 100, 5, 340, 20, 170, gView);
-        dbl("curv", "Lens Curvature", "0 = rectilinear (straight lines), 1 = stereographic (wide, tiny-planet)", 0.25, 0, 1, 0, 1, gView);
+        dbl("pan", "Pan", "Look left (-) / right (+), degrees. Keyframe 0 to 360 for a full spin.", 0, -36000, 36000, -360, 360, gView);
+        dbl("tilt", "Tilt", "Look down (-) / up (+), degrees", 0, -360, 360, -180, 180, gView);
+        dbl("roll", "Roll", "Rotate the view, degrees", 0, -36000, 36000, -180, 180, gView);
+        dbl("fov", "Field of View", "Horizontal field of view, degrees (up to 360 with a fisheye lens curvature)", 100, 1, 360, 10, 360, gView);
+        dbl("curv", "Lens Curvature",
+            "0 = rectilinear (straight lines), 1 = stereographic (wide, tiny planet), 2 = fisheye (can show all 360 degrees)",
+            0.4, 0, 2, 0, 2, gView);
         {
             ChoiceParamDescriptor* p = d.defineChoiceParam("proj");
             p->setLabels("Projection", "Projection", "Projection");
@@ -307,10 +324,10 @@ public:
         {
             ChoiceParamDescriptor* p = d.defineChoiceParam("quality");
             p->setLabels("Quality", "Quality", "Quality");
-            p->setHint("High uses 2x2 supersampling (sharper when zoomed out, 4x slower)");
+            p->setHint("High uses 2x2 supersampling: smoother edges, especially with wide or fisheye views");
             p->appendOption("Normal");
             p->appendOption("High");
-            p->setDefault(0);
+            p->setDefault(1);
             p->setAnimates(false);
             p->setParent(*gAdv);
             page->addChild(*p);

@@ -14,7 +14,7 @@ struct RenderSettings
     double pan = 0, tilt = 0, roll = 0;  // degrees
     Projection proj = Projection::Lens;
     double fovDeg = 100;
-    double curvature = 0.25;
+    double curvature = 0.4;
     int supersample = 1;
 };
 

@@ -10,6 +10,10 @@ data and are ordinary plugin settings, so changing them never means re-exporting
   version. To keep full 8K detail, the plugin reads the clip's source path from Resolve
   (`kOfxImageEffectPropSrcFilePath`) and decodes the `.360` itself. It uses hardware HEVC decoding through
   Media Foundation and D3D11, which works in the free version of Resolve.
+- Rendering runs on CUDA or OpenCL, whichever Resolve is set to (Preferences → Memory and GPU → GPU
+  Processing Mode), and falls back to the CPU. All three paths share one kernel source,
+  `src/reframe_kernel.h`. On an RTX 3060 a UHD frame takes about 8 ms to render, or about 21 ms
+  including the upload of a new source frame.
 - `.360` layout: two 5888×1920 HEVC streams in GoPro's cube-map (EAC) layout. The first holds the left,
   front and right faces; the second holds the bottom, back and top faces, rotated 90°. The left/right and
   top/bottom faces are split by the lens seam, with a 64 px overlap that gets blended.
@@ -40,11 +44,14 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 2. Put a clip on the timeline. Then go to Effects → OpenFX → GoPro 360 → **Max2 Reframe** and drag it onto
    the clip.
 3. Set Pan / Tilt / Roll / Field of View (all keyframeable), and Stabilize / Horizon Lock / Direction Lock.
-   Set Projection to "Equirectangular 360" to get a stabilized 2:1 360 output.
+   - Lens Curvature: 0 is rectilinear, 1 is stereographic (tiny planet: Tilt -90, FOV ~280), and 2 is
+     an equidistant fisheye (FOV 360 shows the whole sphere).
+   - Pan can be keyframed past ±360 for spins.
+   - Set Projection to "Equirectangular 360" to get a stabilized 2:1 360 output.
 
 The log is at `%LOCALAPPDATA%\Max2Reframe\max2reframe.log`.
 
 ## Test tool
 
 `build\max2render.exe file.360 --frame 60 --proj erp --w 1920 --h 960 --dirlock 1 --out out.ppm`
-renders frames without Resolve. `--count N` benchmarks a sequence.
+renders frames without Resolve. `--gpu cuda|opencl` uses a GPU path, and `--count N` benchmarks a sequence.

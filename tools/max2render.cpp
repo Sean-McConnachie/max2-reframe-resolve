@@ -1,27 +1,32 @@
 // Command-line test harness for the reframe engine (no Resolve needed).
 //   max2render file.360 [--frame N] [--count N] [--out out.ppm] [--w 1920] [--h 1080] [--proj lens|erp]
-//              [--fov 100] [--curv 0.25] [--pan 0] [--tilt 0] [--roll 0] [--stab 1] [--horizon 1] [--dirlock 0]
-//              [--smooth 0.3] [--ss 1]
+//              [--fov 100] [--curv 0.4] [--pan 0] [--tilt 0] [--roll 0] [--stab 1] [--horizon 1] [--dirlock 0]
+//              [--smooth 0.3] [--ss 1] [--gpu cpu|cuda|opencl] [--repeat N] [--dump prefix]
 // With --count > 1 it renders a sequence and reports timing; %d in --out is replaced by the frame number.
 #include <windows.h>
+
+#define CL_TARGET_OPENCL_VERSION 120
+#include <CL/cl.h>
+#include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "../src/engine.h"
+#include "../src/gpu.h"
 
+// rgba rows are bottom-up (OFX convention)
 static void writePpm(const std::string& path, const std::vector<float>& rgba, int w, int h)
 {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) return;
     fprintf(f, "P6\n%d %d\n255\n", w, h);
     std::vector<uint8_t> row(size_t(w) * 3);
-    for (int y = 0; y < h; ++y)
+    for (int y = h - 1; y >= 0; --y)
     {
         for (int x = 0; x < w; ++x)
             for (int c = 0; c < 3; ++c)
@@ -31,6 +36,65 @@ static void writePpm(const std::string& path, const std::vector<float>& rgba, in
     fclose(f);
 }
 
+static void dumpStreams(const std::string& prefix, const Nv12Frame& a, const Nv12Frame& b)
+{
+    for (int k = 0; k < 2; ++k)
+    {
+        const Nv12Frame& fr = k ? b : a;
+        FILE* df = fopen((prefix + std::to_string(k) + ".pgm").c_str(), "wb");
+        if (!df) continue;
+        fprintf(df, "P5\n%d %d\n255\n", fr.width, fr.height);
+        for (int y = 0; y < fr.height; ++y) fwrite(fr.y() + size_t(y) * fr.pitch, 1, fr.width, df);
+        fclose(df);
+    }
+}
+
+struct GpuTarget
+{
+    std::string kind = "cpu";
+    // CUDA
+    cudaStream_t stream = nullptr;
+    float* dOut = nullptr;
+    // OpenCL
+    cl_context ctx = nullptr;
+    cl_command_queue queue = nullptr;
+    cl_mem clOut = nullptr;
+
+    bool init(size_t bytes)
+    {
+        if (kind == "cuda")
+        {
+            return cudaStreamCreate(&stream) == cudaSuccess && cudaMalloc(reinterpret_cast<void**>(&dOut), bytes) == cudaSuccess;
+        }
+        if (kind == "opencl")
+        {
+            cl_uint n = 0;
+            clGetPlatformIDs(0, nullptr, &n);
+            std::vector<cl_platform_id> plats(n);
+            clGetPlatformIDs(n, plats.data(), nullptr);
+            cl_device_id dev = nullptr;
+            for (auto pl : plats)
+            {
+                char name[256] = {};
+                clGetPlatformInfo(pl, CL_PLATFORM_NAME, sizeof(name), name, nullptr);
+                cl_device_id d;
+                if (clGetDeviceIDs(pl, CL_DEVICE_TYPE_GPU, 1, &d, nullptr) == CL_SUCCESS && (!dev || strstr(name, "NVIDIA")))
+                {
+                    dev = d;
+                    printf("OpenCL platform: %s\n", name);
+                }
+            }
+            if (!dev) return false;
+            cl_int e;
+            ctx = clCreateContext(nullptr, 1, &dev, nullptr, nullptr, &e);
+            queue = clCreateCommandQueue(ctx, dev, 0, &e);
+            clOut = clCreateBuffer(ctx, CL_MEM_READ_WRITE, bytes, nullptr, &e);
+            return e == CL_SUCCESS;
+        }
+        return true;
+    }
+};
+
 int main(int argc, char** argv)
 {
     if (argc < 2)
@@ -39,10 +103,10 @@ int main(int argc, char** argv)
         return 2;
     }
     std::string path = argv[1];
-    int frame = 0, count = 1, w = 1920, h = 1080;
+    int frame = 0, count = 1, w = 1920, h = 1080, repeat = 1;
     std::string out, dump;
-    int threadsOpt = 0, repeat = 1;
     RenderSettings rs;
+    GpuTarget gpu;
     for (int i = 2; i + 1 < argc; i += 2)
     {
         std::string k = argv[i];
@@ -63,9 +127,9 @@ int main(int argc, char** argv)
         else if (k == "--dirlock") rs.stab.directionLock = atoi(v) != 0;
         else if (k == "--smooth") rs.stab.smoothSeconds = atof(v);
         else if (k == "--ss") rs.supersample = atoi(v);
+        else if (k == "--gpu") gpu.kind = v;
+        else if (k == "--repeat") repeat = std::max(1, atoi(v));
         else if (k == "--dump") dump = v;
-        else if (k == "--threads") threadsOpt = atoi(v);
-        else if (k == "--repeat") repeat = atoi(v);
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
     }
 
@@ -81,8 +145,13 @@ int main(int argc, char** argv)
     printf("%d frames @ %.3f fps, streams %dx%d, gyro %s, tc start %lld\n", info.frames, info.fps(), info.streamW,
            info.streamH, clip->hasGyro() ? "yes" : "no", (long long)info.tcStartFrame);
 
-    unsigned nThreads = threadsOpt > 0 ? unsigned(threadsOpt) : std::max(1u, std::thread::hardware_concurrency());
+    size_t bytes = size_t(w) * h * 4 * sizeof(float);
     std::vector<float> img(size_t(w) * h * 4);
+    if (!gpu.init(bytes))
+    {
+        fprintf(stderr, "could not set up %s\n", gpu.kind.c_str());
+        return 1;
+    }
     double decodeMs = 0, renderMs = 0;
     for (int i = 0; i < count; ++i)
     {
@@ -95,30 +164,28 @@ int main(int argc, char** argv)
             return 1;
         }
         auto b = std::chrono::steady_clock::now();
-        if (!dump.empty())
-            for (int k = 0; k < 2; ++k)
-            {
-                const Nv12Frame& fr = k ? *s1 : *s0;
-                FILE* df = fopen((dump + std::to_string(k) + ".pgm").c_str(), "wb");
-                fprintf(df, "P5\n%d %d\n255\n", fr.width, fr.height);
-                for (int y = 0; y < fr.height; ++y) fwrite(fr.y() + size_t(y) * fr.pitch, 1, fr.width, df);
-                fclose(df);
-            }
+        if (!dump.empty()) dumpStreams(dump, *s0, *s1);
         if (s0->index != f || s1->index != f) fprintf(stderr, "frame mismatch: wanted %d got %d/%d\n", f, s0->index, s1->index);
-        Reprojector rp(*s0, *s1, clip->view(f, rs), w, h);
-        for (int rep = 0; rep < repeat; ++rep) {
-        std::vector<std::thread> pool;
-        for (unsigned t = 0; t < nThreads; ++t)
-            pool.emplace_back([&, t] {
-                for (int y = int(t); y < h; y += int(nThreads)) rp.renderRow(y, 0, w, img.data() + size_t(y) * w * 4);
-            });
-        for (auto& th : pool) th.join();
+        ViewParams vp = clip->view(f, rs);
+        for (int rep = 0; rep < repeat; ++rep)
+        {
+            bool ok = true;
+            if (gpu.kind == "cuda") ok = cudaRender(gpu.stream, makeRfParams(vp, *s0, w, h, w * 4), s0, s1, gpu.dOut, &err);
+            else if (gpu.kind == "opencl") ok = openclRender(gpu.queue, makeRfParams(vp, *s0, w, h, w * 4), s0, s1, gpu.clOut, &err);
+            else Reprojector(*s0, *s1, vp, w, h).renderAll(img.data(), w * 4);
+            if (!ok)
+            {
+                fprintf(stderr, "%s render failed: %s\n", gpu.kind.c_str(), err.c_str());
+                return 1;
+            }
         }
         auto c = std::chrono::steady_clock::now();
         decodeMs += std::chrono::duration<double, std::milli>(b - a).count();
         renderMs += std::chrono::duration<double, std::milli>(c - b).count() / repeat;
         if (!out.empty())
         {
+            if (gpu.kind == "cuda") cudaMemcpy(img.data(), gpu.dOut, bytes, cudaMemcpyDeviceToHost);
+            else if (gpu.kind == "opencl") clEnqueueReadBuffer(gpu.queue, gpu.clOut, CL_TRUE, 0, bytes, img.data(), 0, nullptr, nullptr);
             std::string o = out;
             size_t p = o.find("%d");
             if (p != std::string::npos) o.replace(p, 2, std::to_string(f));
@@ -126,7 +193,7 @@ int main(int argc, char** argv)
         }
     }
     double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    printf("decode %.1f ms/frame, render %.1f ms/frame (%dx%d, %u threads), total %.0f ms\n", decodeMs / count,
-           renderMs / count, w, h, nThreads, total);
+    printf("[%s] decode %.1f ms/frame, render %.1f ms/frame (%dx%d), total %.0f ms\n", gpu.kind.c_str(), decodeMs / count,
+           renderMs / count, w, h, total);
     return 0;
 }
