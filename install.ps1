@@ -96,7 +96,7 @@ Remove-Item (Join-Path $scriptDir 'Import GoPro 360.py') -ErrorAction SilentlyCo
 Copy-Item $srcScript (Join-Path $scriptDir $importScript) -Force
 # Resolve's script Lua cannot show a folder dialog or make links, so a PowerShell helper does both.
 New-Item -ItemType Directory -Force $helperDir | Out-Null
-Copy-Item $srcHelper (Join-Path $helperDir $helperName) -Force
+Copy-Item $srcHelper, ($srcHelper -replace '\.ps1$', '.cmd') $helperDir -Force
 
 # Resolve remembers plugins that failed to load and will not retry them; drop our entries so it rescans.
 $cache = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml'

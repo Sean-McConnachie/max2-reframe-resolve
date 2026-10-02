@@ -1,26 +1,34 @@
-# Helper for the "Import GoPro 360" Resolve script. Resolve runs menu scripts in a restricted Lua (no require, no
-# io, and Fusion's folder dialog does not open from the Edit page), so this part runs in PowerShell:
+# Helper for the "Import GoPro 360" Resolve script. Resolve runs menu scripts in a restricted Lua (no require, io or
+# os.execute, and Fusion's folder dialog does not open from the Edit page), so this part runs in PowerShell. The Lua
+# script starts it through "Import GoPro 360.cmd" and waits for result.txt:
 #  1. Shows the Windows folder dialog (or uses -Folder).
 #  2. Finds the .360 files in the folder and its subfolders.
 #  3. Gives each one an .mp4 hard link in a hidden "_Max2Reframe" folder next to it.
 #  4. Writes the list of links to result.txt as a Lua table, for the Lua script to import.
-param([string]$Token = '', [string]$Folder = '')
+param([string]$Folder = '')
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $resultPath = Join-Path $here 'result.txt'
 $logPath = Join-Path $here 'import.log'
 $settingsPath = Join-Path $here 'last-folder.txt'
 $utf8 = New-Object Text.UTF8Encoding $false
+if (-not $Folder -and $env:MAX2_TEST_DIR) { $Folder = $env:MAX2_TEST_DIR } # test without the dialog
+$Token = [DateTime]::Now.ToString('yyyyMMddHHmmssfff')
 
 function Log($msg) { [IO.File]::AppendAllText($logPath, (Get-Date -Format 'yyyy-MM-dd HH:mm:ss ') + $msg + "`r`n", $utf8) }
 function Lua($s) { '[==[' + $s + ']==]' }
+function Write-Result($text) {
+    # write then rename, so the Lua script never reads a half-written file
+    [IO.File]::WriteAllText("$resultPath.tmp", $text, $utf8)
+    Move-Item -LiteralPath "$resultPath.tmp" -Destination $resultPath -Force
+}
 
 $status = 'ok'
 $links = @()
 $errors = @()
 try {
-    Remove-Item $resultPath -ErrorAction SilentlyContinue
     Log "started, token $Token"
+    Write-Result "{ Token = $(Lua $Token), Status = $(Lua 'running') }`n"
 
     if (-not $Folder) {
         Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
@@ -117,4 +125,4 @@ foreach ($l in $links) { [void]$out.Append("    { Path = $(Lua $l[0]), Name = $(
 [void]$out.Append("  },`n  Errors = {`n")
 foreach ($e in $errors) { [void]$out.Append("    $(Lua $e),`n") }
 [void]$out.Append("  },`n}`n")
-[IO.File]::WriteAllText($resultPath, $out.ToString(), $utf8)
+Write-Result $out.ToString()
