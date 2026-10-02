@@ -73,6 +73,8 @@ Resolve does not import files with the `.360` extension. The script gives each `
 
 ## Settings
 
+<img src="docs/images/inspector.png" alt="The Max2 Reframe settings in the Resolve Inspector" width="400">
+
 | Setting | What it does |
 |---|---|
 | Pan, Tilt, Roll | Set the view direction in degrees. For a spin, use keyframes past 360 degrees. |
