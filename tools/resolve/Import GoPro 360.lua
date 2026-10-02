@@ -18,8 +18,21 @@ int CreateDirectoryW(const wchar_t* path, void* sa);
 int SetFileAttributesW(const wchar_t* path, unsigned long attrs);
 int DeleteFileW(const wchar_t* path);
 unsigned long GetLastError(void);
+int WideCharToMultiByte(unsigned int cp, unsigned long flags, const wchar_t* w, int wn, char* s, int n, const char* d, int* u);
+typedef struct {
+    void* hwndOwner; void* pidlRoot; wchar_t* pszDisplayName; const wchar_t* lpszTitle;
+    unsigned int ulFlags; void* lpfn; intptr_t lParam; int iImage;
+} BROWSEINFOW;
+void* SHBrowseForFolderW(BROWSEINFOW* bi);
+int SHGetPathFromIDListW(void* pidl, wchar_t* path);
+long CoInitializeEx(void* reserved, unsigned long coinit);
+void CoTaskMemFree(void* p);
+void* GetForegroundWindow(void);
 ]]
 local k32 = ffi.load("kernel32")
+local shell32 = ffi.load("shell32")
+local ole32 = ffi.load("ole32")
+local user32 = ffi.load("user32")
 local LINK_DIR = "_Max2Reframe"
 
 local function wide(s)
@@ -27,6 +40,30 @@ local function wide(s)
     local buf = ffi.new("wchar_t[?]", n)
     k32.MultiByteToWideChar(65001, 0, s, -1, buf, n)
     return buf
+end
+
+local function utf8(w)
+    local n = k32.WideCharToMultiByte(65001, 0, w, -1, nil, 0, nil, nil)
+    local buf = ffi.new("char[?]", n)
+    k32.WideCharToMultiByte(65001, 0, w, -1, buf, n, nil, nil)
+    return ffi.string(buf)
+end
+
+-- Windows folder browser. (Fusion's RequestDir does not open from the Edit page.) Returns nil on cancel.
+local function pickFolder(title)
+    ole32.CoInitializeEx(nil, 0x2) -- apartment threaded; harmless if COM is already initialised
+    local name = ffi.new("wchar_t[260]")
+    local bi = ffi.new("BROWSEINFOW")
+    bi.hwndOwner = user32.GetForegroundWindow()
+    bi.pszDisplayName = name
+    bi.lpszTitle = wide(title)
+    bi.ulFlags = 0x1 + 0x40 + 0x200 -- return only file system folders, new dialog style, no "new folder" button
+    local pidl = shell32.SHBrowseForFolderW(bi)
+    if pidl == nil then return nil end
+    local path = ffi.new("wchar_t[32768]")
+    local ok = shell32.SHGetPathFromIDListW(pidl, path) ~= 0
+    ole32.CoTaskMemFree(pidl)
+    return ok and utf8(path) or nil
 end
 
 local function join(a, b)
@@ -107,9 +144,9 @@ local res = resolve or (bmd and bmd.scriptapp and bmd.scriptapp("Resolve"))
 if not res then print("Import GoPro 360: could not connect to Resolve") return end
 local project = res:GetProjectManager():GetCurrentProject()
 if not project then print("Import GoPro 360: open a project first") return end
-local fu = fusion or fu or res:Fusion()
-local folder = fu and fu:RequestDir(os.getenv("USERPROFILE") or "C:\\")
-if not folder or folder == "" then return end
+local folder = pickFolder("Import GoPro 360: select the folder with your .360 files (subfolders are included)")
+if not folder or folder == "" then print("Import GoPro 360: no folder selected") return end
+print("Import GoPro 360: scanning " .. folder)
 
 local files, links, failed = linkAll(folder)
 if #files == 0 then print("Import GoPro 360: no .360 files in " .. folder) return end
