@@ -13,6 +13,7 @@ struct Mp4Track
     uint32_t timescale = 0;
     uint64_t duration = 0;
     int width = 0, height = 0;
+    int bitDepth = 8;         // HEVC luma bit depth (from hvcC)
     std::vector<uint64_t> offsets;  // per sample
     std::vector<uint32_t> sizes;    // per sample
     std::vector<int64_t> times;     // per sample decode time, in timescale units

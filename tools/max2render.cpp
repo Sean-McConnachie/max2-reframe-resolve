@@ -2,6 +2,7 @@
 //   max2render file.360 [--frame N] [--count N] [--out out.ppm] [--w 1920] [--h 1080] [--proj lens|erp]
 //              [--fov 100] [--curv 0.4] [--pan 0] [--tilt 0] [--roll 0] [--stab 1] [--horizon 1] [--dirlock 0]
 //              [--smooth 0.3] [--ss 1] [--gpu cpu|cuda|opencl] [--repeat N] [--dump prefix]
+//              [--bits 8|16] (bits of the PPM)
 //              [--mb shutterAngle] [--mbmax 32] [--panrate deg/frame] [--tiltrate deg/frame] [--fovrate deg/frame]
 // With --count > 1 it renders a sequence and reports timing; %d in --out is replaced by the frame number.
 #include <windows.h>
@@ -21,17 +22,24 @@
 #include "../src/gpu.h"
 
 // rgba rows are bottom-up (OFX convention)
-static void writePpm(const std::string& path, const std::vector<float>& rgba, int w, int h)
+static void writePpm(const std::string& path, const std::vector<float>& rgba, int w, int h, int bits)
 {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) return;
-    fprintf(f, "P6\n%d %d\n255\n", w, h);
-    std::vector<uint8_t> row(size_t(w) * 3);
+    const int bytes = bits > 8 ? 2 : 1;
+    const float maxv = bytes == 2 ? 65535.0f : 255.0f;
+    fprintf(f, "P6\n%d %d\n%d\n", w, h, int(maxv));
+    std::vector<uint8_t> row(size_t(w) * 3 * bytes);
     for (int y = h - 1; y >= 0; --y)
     {
         for (int x = 0; x < w; ++x)
             for (int c = 0; c < 3; ++c)
-                row[size_t(x) * 3 + c] = uint8_t(std::clamp(rgba[(size_t(y) * w + x) * 4 + c], 0.0f, 1.0f) * 255.0f + 0.5f);
+            {
+                unsigned v = unsigned(std::clamp(rgba[(size_t(y) * w + x) * 4 + c], 0.0f, 1.0f) * maxv + 0.5f);
+                uint8_t* o = row.data() + (size_t(x) * 3 + c) * bytes;
+                if (bytes == 2) { o[0] = uint8_t(v >> 8); o[1] = uint8_t(v); }  // PPM is big-endian
+                else o[0] = uint8_t(v);
+            }
         fwrite(row.data(), 1, row.size(), f);
     }
     fclose(f);
@@ -44,8 +52,15 @@ static void dumpStreams(const std::string& prefix, const Nv12Frame& a, const Nv1
         const Nv12Frame& fr = k ? b : a;
         FILE* df = fopen((prefix + std::to_string(k) + ".pgm").c_str(), "wb");
         if (!df) continue;
-        fprintf(df, "P5\n%d %d\n255\n", fr.width, fr.height);
-        for (int y = 0; y < fr.height; ++y) fwrite(fr.y() + size_t(y) * fr.pitch, 1, fr.width, df);
+        fprintf(df, "P5\n%d %d\n%d\n", fr.width, fr.height, fr.bytesPerSample == 2 ? 65535 : 255);
+        std::vector<uint8_t> row(fr.y(), fr.y() + fr.pitch);
+        for (int y = 0; y < fr.height; ++y)
+        {
+            std::memcpy(row.data(), fr.y() + size_t(y) * fr.pitch, row.size());
+            if (fr.bytesPerSample == 2)
+                for (size_t i = 0; i + 1 < row.size(); i += 2) std::swap(row[i], row[i + 1]);  // PGM is big-endian
+            fwrite(row.data(), 1, row.size(), df);
+        }
         fclose(df);
     }
 }
@@ -104,7 +119,7 @@ int main(int argc, char** argv)
         return 2;
     }
     std::string path = argv[1];
-    int frame = 0, count = 1, w = 1920, h = 1080, repeat = 1;
+    int frame = 0, count = 1, w = 1920, h = 1080, repeat = 1, bits = 8;
     std::string out, dump;
     RenderSettings rs;
     GpuTarget gpu;
@@ -133,6 +148,7 @@ int main(int argc, char** argv)
         else if (k == "--gpu") gpu.kind = v;
         else if (k == "--repeat") repeat = std::max(1, atoi(v));
         else if (k == "--dump") dump = v;
+        else if (k == "--bits") bits = atoi(v);
         else if (k == "--mb") { mb.enabled = true; mb.shutterAngle = atof(v); }
         else if (k == "--mbmax") mb.maxSamples = atoi(v);
         else if (k == "--panrate") panRate = atof(v);
@@ -150,8 +166,8 @@ int main(int argc, char** argv)
         return 1;
     }
     const auto& info = clip->info();
-    printf("%d frames @ %.3f fps, streams %dx%d, gyro %s, tc start %lld\n", info.frames, info.fps(), info.streamW,
-           info.streamH, clip->hasGyro() ? "yes" : "no", (long long)info.tcStartFrame);
+    printf("%d frames @ %.3f fps, streams %dx%d %d-bit, gyro %s, tc start %lld\n", info.frames, info.fps(), info.streamW,
+           info.streamH, info.bitDepth, clip->hasGyro() ? "yes" : "no", (long long)info.tcStartFrame);
 
     size_t bytes = size_t(w) * h * 4 * sizeof(float);
     std::vector<float> img(size_t(w) * h * 4);
@@ -208,7 +224,7 @@ int main(int argc, char** argv)
             std::string o = out;
             size_t p = o.find("%d");
             if (p != std::string::npos) o.replace(p, 2, std::to_string(f));
-            writePpm(o, img, w, h);
+            writePpm(o, img, w, h, bits);
         }
     }
     double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();

@@ -18,6 +18,7 @@ struct Source360Info
     double fps() const { return double(fpsNum) / fpsDen; }
     int64_t tcStartFrame = -1;  // timecode of first frame as a frame count, -1 if none
     int streamW = 0, streamH = 0;
+    int bitDepth = 8;           // 10 for 10-bit recordings (GP-Log)
     int videoTracks = 0;
     std::vector<uint32_t> videoTrackIds;  // MP4 track IDs of the video tracks, in file order
     std::vector<uint32_t> videoFirstSampleSizes;

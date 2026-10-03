@@ -44,11 +44,12 @@ struct StreamDecoder::Impl
     ComPtr<ID3D11Texture2D> staging;
     UINT stagingW = 0, stagingH = 0;
     UINT width = 0, height = 0;
+    int bps = 1;  // bytes per sample of the negotiated output: 1 NV12, 2 P010
 };
 
 StreamDecoder::StreamDecoder(const std::wstring& path, uint32_t trackId, uint32_t firstSampleSize, int videoOrdinal,
-                             int fpsNum, int fpsDen, int frameCount)
-    : m_Path(path), m_TrackId(trackId), m_FirstSampleSize(firstSampleSize), m_Ordinal(videoOrdinal), m_FpsNum(fpsNum), m_FpsDen(fpsDen), m_Frames(frameCount)
+                             int fpsNum, int fpsDen, int frameCount, int bitDepth)
+    : m_Path(path), m_TrackId(trackId), m_FirstSampleSize(firstSampleSize), m_Ordinal(videoOrdinal), m_FpsNum(fpsNum), m_FpsDen(fpsDen), m_Frames(frameCount), m_BitDepth(bitDepth)
 {
     m_Thread = std::thread([this] { run(); });
 }
@@ -206,14 +207,20 @@ bool StreamDecoder::openReader()
         }
         d.reader->SetStreamSelection(DWORD(MF_SOURCE_READER_ALL_STREAMS), FALSE);
         d.reader->SetStreamSelection(d.stream, TRUE);
-        ComPtr<IMFMediaType> out;
-        MFCreateMediaType(&out);
-        out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-        hr = d.reader->SetCurrentMediaType(d.stream, nullptr, out.Get());
+        // 10-bit streams decode to P010 so that no precision is lost; 8-bit streams decode to NV12
+        hr = E_FAIL;
+        for (int bps = m_BitDepth > 8 ? 2 : 1; bps >= 1 && FAILED(hr); --bps)
+        {
+            ComPtr<IMFMediaType> out;
+            MFCreateMediaType(&out);
+            out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+            out->SetGUID(MF_MT_SUBTYPE, bps == 2 ? MFVideoFormat_P010 : MFVideoFormat_NV12);
+            hr = d.reader->SetCurrentMediaType(d.stream, nullptr, out.Get());
+            if (SUCCEEDED(hr)) d.bps = bps;
+        }
         if (FAILED(hr))
         {
-            logf("decoder: NV12 output not available with %s decode (%s)", useHw ? "hardware" : "software", hrStr(hr).c_str());
+            logf("decoder: no %d-bit output available with %s decode (%s)", m_BitDepth, useHw ? "hardware" : "software", hrStr(hr).c_str());
             if (useHw) continue;
             m_Error = "no HEVC decoder available (install 'HEVC Video Extensions' from the Microsoft Store) " + hrStr(hr);
             return false;
@@ -222,7 +229,8 @@ bool StreamDecoder::openReader()
         d.reader->GetCurrentMediaType(d.stream, &cur);
         MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &d.width, &d.height);
         m_Hardware = useHw;
-        logf("decoder: opened stream %d (%ux%u) with %s decode", m_Ordinal, d.width, d.height, useHw ? "hardware" : "software");
+        logf("decoder: opened stream %d (%ux%u %s) with %s decode", m_Ordinal, d.width, d.height, d.bps == 2 ? "P010" : "NV12",
+             useHw ? "hardware" : "software");
         return true;
     }
     return false;
@@ -272,8 +280,11 @@ std::shared_ptr<Nv12Frame> StreamDecoder::readFrame(bool& eos)
         f->index = int(std::llround(double(ts) * m_FpsNum / (double(m_FpsDen) * 1e7)));
         f->width = int(d.width);
         f->height = int(d.height);
-        f->pitch = int(d.width);
-        f->data.resize(size_t(f->pitch) * f->height * 3 / 2);
+        auto alloc = [&](int bps) {
+            f->bytesPerSample = bps;
+            f->pitch = f->width * bps;
+            f->data.resize(size_t(f->pitch) * f->height * 3 / 2);
+        };
 
         ComPtr<IMFMediaBuffer> buf;
         if (FAILED(sample->GetBufferByIndex(0, &buf))) continue;
@@ -285,6 +296,14 @@ std::shared_ptr<Nv12Frame> StreamDecoder::readFrame(bool& eos)
             if (FAILED(dx->GetResource(IID_PPV_ARGS(&tex))) || FAILED(dx->GetSubresourceIndex(&sub))) continue;
             D3D11_TEXTURE2D_DESC desc;
             tex->GetDesc(&desc);
+            // the texture format is what the decoder really produced
+            if (desc.Format == DXGI_FORMAT_P010 || desc.Format == DXGI_FORMAT_P016) alloc(2);
+            else if (desc.Format == DXGI_FORMAT_NV12) alloc(1);
+            else
+            {
+                m_Error = "unsupported decoder output format " + std::to_string(int(desc.Format));
+                return nullptr;
+            }
             if (!d.staging || d.stagingW != desc.Width || d.stagingH != desc.Height)
             {
                 D3D11_TEXTURE2D_DESC sd = {};
@@ -314,22 +333,23 @@ std::shared_ptr<Nv12Frame> StreamDecoder::readFrame(bool& eos)
             }
             const uint8_t* src = static_cast<const uint8_t*>(map.pData);
             for (int y = 0; y < f->height; ++y)
-                std::memcpy(f->data.data() + size_t(y) * f->pitch, src + size_t(y) * map.RowPitch, f->width);
+                std::memcpy(f->data.data() + size_t(y) * f->pitch, src + size_t(y) * map.RowPitch, f->pitch);
             const uint8_t* srcUv = src + size_t(map.RowPitch) * desc.Height;
             uint8_t* dstUv = f->data.data() + size_t(f->pitch) * f->height;
             for (int y = 0; y < f->height / 2; ++y)
-                std::memcpy(dstUv + size_t(y) * f->pitch, srcUv + size_t(y) * map.RowPitch, f->width);
+                std::memcpy(dstUv + size_t(y) * f->pitch, srcUv + size_t(y) * map.RowPitch, f->pitch);
             d.ctx->Unmap(d.staging.Get(), 0);
         }
         else
         {
+            alloc(d.bps);
             ComPtr<IMF2DBuffer> b2;
             BYTE* p = nullptr;
             LONG pitch = 0;
             if (SUCCEEDED(buf.As(&b2)) && SUCCEEDED(b2->Lock2D(&p, &pitch)))
             {
                 for (int y = 0; y < f->height * 3 / 2; ++y)
-                    std::memcpy(f->data.data() + size_t(y) * f->pitch, p + size_t(y) * pitch, f->width);
+                    std::memcpy(f->data.data() + size_t(y) * f->pitch, p + size_t(y) * pitch, f->pitch);
                 b2->Unlock2D();
             }
             else

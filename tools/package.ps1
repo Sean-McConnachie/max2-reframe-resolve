@@ -1,5 +1,5 @@
 # Builds a release zip in dist\: Max2Reframe-<version>-win64.zip
-param([string]$Version = '1.2.1')
+param([string]$Version = '1.2.2')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 

@@ -10,7 +10,7 @@ EacLayout EacLayout::fromStream(int w, int h)
 {
     EacLayout l;
     l.face = h;
-    int extra = std::max(0, w - 3 * h);  // 128 on Max 2 (5888 = 3 * 1920 + 128)
+    int extra = std::max(0, w - 3 * h);  // Max 2: 128 in 8-bit files (5888 wide), 192 in 10-bit files (5952 wide)
     l.ovl = extra / 2;
     l.half = h / 2 + extra / 4;
     l.mid = 2 * l.half;
@@ -49,6 +49,10 @@ RfParams makeRfParams(const ViewParams& vp, const Nv12Frame& stream, int outW, i
     p.srcH = stream.height;
     p.srcPitch = stream.pitch;
     p.uvOffset = stream.pitch * stream.height;
+    // Full-range video. P010 keeps the 10-bit code in the high bits: white is 1023 << 6, zero chroma is 512 << 6.
+    p.bps = stream.bytesPerSample;
+    p.scale = p.bps == 2 ? 1.0f / 65472.0f : 1.0f / 255.0f;
+    p.chromaZero = p.bps == 2 ? 32768.0f : 128.0f;
     return p;
 }
 

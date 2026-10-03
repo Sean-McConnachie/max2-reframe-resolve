@@ -2,7 +2,7 @@
  * Keep this file plain C: it is also embedded as OpenCL source at build time.
  *
  * Camera coordinates: +x right, +y up, +z forward (front lens).
- * Input: two NV12 frames in GoPro EAC layout (see EacLayout in reproject.h).
+ * Input: two NV12 (8-bit) or P010 (10-bit) frames in GoPro EAC layout (see EacLayout in reproject.h).
  * Output: RGBA float, row 0 of the buffer is the BOTTOM row of the image (OFX convention).
  */
 #ifndef REFRAME_KERNEL_H
@@ -56,8 +56,11 @@ typedef struct RfParams
     int outStride;    /* floats per output row */
     int ss;           /* supersampling (ss x ss per pixel) */
     int face, halfW, ovl, mid, right; /* EAC layout */
-    int srcW, srcH, srcPitch;        /* NV12 stream size and row pitch (bytes) */
+    int srcW, srcH, srcPitch;        /* stream size (pixels) and row pitch (bytes) */
     int uvOffset;                    /* bytes from the Y plane to the interleaved UV plane */
+    int bps;                         /* bytes per sample: 1 = NV12, 2 = P010 (little-endian 16-bit) */
+    float scale;                     /* sample value -> 0..1 */
+    float chromaZero;                /* sample value of zero chroma */
     float jitterX, jitterY;          /* sub-pixel sample offset (varies per motion blur step) */
 } RfParams;
 
@@ -74,8 +77,15 @@ RF_FN float rf_atan_unit(float x)
 RF_FN float rf_clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 RF_FN int rf_mini(int a, int b) { return a < b ? a : b; }
 
-/* Bilinear NV12 sample at stream pixel (x, y), x clamped to [xmin, xmax]. Returns Y, U, V in 0..255. */
-RF_FN void rf_sample_nv12(RF_GLOBAL const rf_uchar* Y, RF_GLOBAL const rf_uchar* UV, int pitch, int h,
+/* One sample of a plane, starting at byte i. */
+RF_FN float rf_px(RF_GLOBAL const rf_uchar* p, int i, int bps)
+{
+    return bps == 2 ? (float)((int)p[i] | ((int)p[i + 1] << 8)) : (float)p[i];
+}
+
+/* Bilinear sample at stream pixel (x, y), x clamped to [xmin, xmax]. Returns Y, U, V as sample values
+ * (0..255 for NV12, 0..65535 for P010). */
+RF_FN void rf_sample_nv12(RF_GLOBAL const rf_uchar* Y, RF_GLOBAL const rf_uchar* UV, int pitch, int bps, int h,
                           float x, float y, float xmin, float xmax, float* oy, float* ou, float* ov)
 {
     x = rf_clampf(x, xmin, xmax);
@@ -83,7 +93,8 @@ RF_FN void rf_sample_nv12(RF_GLOBAL const rf_uchar* Y, RF_GLOBAL const rf_uchar*
     int x0 = (int)x, y0 = (int)y;
     int x1 = rf_mini(x0 + 1, (int)xmax), y1 = rf_mini(y0 + 1, h - 1);
     float fx = x - (float)x0, fy = y - (float)y0;
-    float a = Y[y0 * pitch + x0], b = Y[y0 * pitch + x1], c = Y[y1 * pitch + x0], d = Y[y1 * pitch + x1];
+    float a = rf_px(Y, y0 * pitch + x0 * bps, bps), b = rf_px(Y, y0 * pitch + x1 * bps, bps);
+    float c = rf_px(Y, y1 * pitch + x0 * bps, bps), d = rf_px(Y, y1 * pitch + x1 * bps, bps);
     *oy = (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy;
 
     float cx = rf_clampf(x * 0.5f - 0.25f, xmin * 0.5f, xmax * 0.5f);
@@ -91,9 +102,12 @@ RF_FN void rf_sample_nv12(RF_GLOBAL const rf_uchar* Y, RF_GLOBAL const rf_uchar*
     int cx0 = (int)cx, cy0 = (int)cy;
     int cx1 = rf_mini(cx0 + 1, (int)(xmax * 0.5f)), cy1 = rf_mini(cy0 + 1, h / 2 - 1);
     float gx = cx - (float)cx0, gy = cy - (float)cy0;
-    int i00 = cy0 * pitch + cx0 * 2, i10 = cy0 * pitch + cx1 * 2, i01 = cy1 * pitch + cx0 * 2, i11 = cy1 * pitch + cx1 * 2;
-    float u0 = UV[i00] + (UV[i10] - (float)UV[i00]) * gx, u1 = UV[i01] + (UV[i11] - (float)UV[i01]) * gx;
-    float v0 = UV[i00 + 1] + (UV[i10 + 1] - (float)UV[i00 + 1]) * gx, v1 = UV[i01 + 1] + (UV[i11 + 1] - (float)UV[i01 + 1]) * gx;
+    int cs = 2 * bps; /* bytes per UV pair */
+    int i00 = cy0 * pitch + cx0 * cs, i10 = cy0 * pitch + cx1 * cs, i01 = cy1 * pitch + cx0 * cs, i11 = cy1 * pitch + cx1 * cs;
+    float u00 = rf_px(UV, i00, bps), u10 = rf_px(UV, i10, bps), u01 = rf_px(UV, i01, bps), u11 = rf_px(UV, i11, bps);
+    float v00 = rf_px(UV, i00 + bps, bps), v10 = rf_px(UV, i10 + bps, bps), v01 = rf_px(UV, i01 + bps, bps), v11 = rf_px(UV, i11 + bps, bps);
+    float u0 = u00 + (u10 - u00) * gx, u1 = u01 + (u11 - u01) * gx;
+    float v0 = v00 + (v10 - v00) * gx, v1 = v01 + (v11 - v01) * gx;
     *ou = u0 + (u1 - u0) * gy;
     *ov = v0 + (v1 - v0) * gy;
 }
@@ -165,7 +179,7 @@ RF_FN void rf_sample_dir(const RfParams* p, RF_GLOBAL const rf_uchar* Y0, RF_GLO
     float sy, su, sv;
     if (slot == 1)
     {
-        rf_sample_nv12(Y, UV, p->srcPitch, p->srcH, (float)p->mid + cu, cv, 0.0f, (float)(p->srcW - 1), &sy, &su, &sv);
+        rf_sample_nv12(Y, UV, p->srcPitch, p->bps, p->srcH, (float)p->mid + cu, cv, 0.0f, (float)(p->srcW - 1), &sy, &su, &sv);
     }
     else
     {
@@ -175,13 +189,13 @@ RF_FN void rf_sample_dir(const RfParams* p, RF_GLOBAL const rf_uchar* Y0, RF_GLO
         float startB = face - hf;
         float wb = rf_clampf((cu - startB) / (float)(p->ovl > 0 ? p->ovl : 1), 0.0f, 1.0f);
         float ay_ = 0, au = 0, av = 0, by = 0, bu = 0, bv = 0;
-        if (wb < 1.0f) rf_sample_nv12(Y, UV, p->srcPitch, p->srcH, base + cu, cv, base, base + hf - 1.0f, &ay_, &au, &av);
-        if (wb > 0.0f) rf_sample_nv12(Y, UV, p->srcPitch, p->srcH, base + hf + (cu - startB), cv, base + hf, base + 2.0f * hf - 1.0f, &by, &bu, &bv);
+        if (wb < 1.0f) rf_sample_nv12(Y, UV, p->srcPitch, p->bps, p->srcH, base + cu, cv, base, base + hf - 1.0f, &ay_, &au, &av);
+        if (wb > 0.0f) rf_sample_nv12(Y, UV, p->srcPitch, p->bps, p->srcH, base + hf + (cu - startB), cv, base + hf, base + 2.0f * hf - 1.0f, &by, &bu, &bv);
         sy = ay_ + (by - ay_) * wb;
         su = au + (bu - au) * wb;
         sv = av + (bv - av) * wb;
     }
-    float yy = sy * (1.0f / 255.0f), cb = (su - 128.0f) * (1.0f / 255.0f), cr = (sv - 128.0f) * (1.0f / 255.0f);
+    float yy = sy * p->scale, cb = (su - p->chromaZero) * p->scale, cr = (sv - p->chromaZero) * p->scale;
     rgb[0] = yy + 1.5748f * cr;
     rgb[1] = yy - 0.187324f * cb - 0.468124f * cr;
     rgb[2] = yy + 1.8556f * cb;

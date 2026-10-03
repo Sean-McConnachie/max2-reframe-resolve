@@ -75,6 +75,13 @@ void parseStbl(const Box& stbl, Mp4Track& t)
                 t.tmcdFrameDuration = be32(q + 20);
                 t.tmcdFrames = q[24];
             }
+            else if ((t.codec == "hvc1" || t.codec == "hev1") && esize > 86 && 8 + size_t(esize) <= b.size)
+            {
+                // the visual sample entry is 86 bytes; hvcC keeps bitDepthLumaMinus8 in byte 17
+                forBoxes(e + 86, esize - 86, [&](const Box& c) {
+                    if (c.type == "hvcC" && c.size >= 18) t.bitDepth = 8 + (c.data[17] & 7);
+                });
+            }
         }
         else if (b.type == "stts" && b.size >= 8)
         {

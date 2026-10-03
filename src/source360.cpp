@@ -172,6 +172,7 @@ bool loadSource360(const std::wstring& path, Source360Info& info, std::string* e
     info.frames = int(v0->sizes.size());
     info.streamW = v0->width;
     info.streamH = v0->height;
+    info.bitDepth = v0->bitDepth;
     if (v0->times.size() >= 2 && v0->timescale)
     {
         info.fpsNum = int(v0->timescale);

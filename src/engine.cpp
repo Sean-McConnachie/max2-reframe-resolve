@@ -85,8 +85,8 @@ std::shared_ptr<Clip360> Clip360::open(const std::wstring& path, std::string* er
         if (err) *err = e;
         return nullptr;
     }
-    logf("open %s: %d frames @ %d/%d fps, streams %dx%d, tc start %lld, CORI %zu IORI %zu GRAV %zu",
-         wideToUtf8(path).c_str(), info.frames, info.fpsNum, info.fpsDen, info.streamW, info.streamH,
+    logf("open %s: %d frames @ %d/%d fps, streams %dx%d %d-bit, tc start %lld, CORI %zu IORI %zu GRAV %zu",
+         wideToUtf8(path).c_str(), info.frames, info.fpsNum, info.fpsDen, info.streamW, info.streamH, info.bitDepth,
          (long long)info.tcStartFrame, info.cori.size(), info.iori.size(), info.grav.size());
     auto clip = std::make_shared<Clip360>(info);
     std::lock_guard<std::mutex> lock(r.mutex);
@@ -101,7 +101,7 @@ Clip360::Clip360(const Source360Info& info) : m_Info(info), m_Stab(info)
 {
     for (int i = 0; i < 2; ++i)
         m_Dec[i] = std::make_unique<StreamDecoder>(info.path, info.videoTrackIds[i], info.videoFirstSampleSizes[i], i,
-                                                 info.fpsNum, info.fpsDen, info.frames);
+                                                 info.fpsNum, info.fpsDen, info.frames, info.bitDepth);
 }
 
 bool Clip360::fetch(int frame, std::shared_ptr<const Nv12Frame>& s0, std::shared_ptr<const Nv12Frame>& s1, std::string* err)

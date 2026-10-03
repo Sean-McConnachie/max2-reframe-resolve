@@ -27,6 +27,7 @@ This workflow has these problems:
 ## What Max2 Reframe does
 
 - Reads the two lens streams of the `.360` file at full resolution. The GPU decodes the HEVC video. This also works in the free version of Resolve.
+- Reads 8-bit and 10-bit files. A 10-bit file, for example a GP-Log recording, keeps its 10-bit precision. The plugin does not change the colors, so you apply the log conversion or LUT in Resolve.
 - Stabilizes with the gyro data in the `.360` file. The result is within approximately 1 degree of GoPro Player.
 - Works on the Edit page.
 - Renders with CUDA or OpenCL, as set in Resolve. If the GPU fails, it renders with the CPU.
@@ -139,7 +140,7 @@ You need Visual Studio 2022 with the C++ tools and the CUDA Toolkit 12.
 ## How it works
 
 - In each render call, Resolve gives the path of the source file. The plugin decodes this file itself, because Resolve gives Edit page effects only timeline resolution.
-- A Max 2 `.360` file has two 5888 x 1920 HEVC streams in the equi-angular cubemap (EAC) layout of GoPro. CUDA, OpenCL and the CPU use one shared sampling function in `src/reframe_kernel.h`.
+- A Max 2 `.360` file has two HEVC streams in the equi-angular cubemap (EAC) layout of GoPro. An 8-bit stream is 5888 x 1920. A 10-bit stream is 5952 x 1920, and the decoder supplies it as P010. CUDA, OpenCL and the CPU use one shared sampling function in `src/reframe_kernel.h`.
 - The camera orientation comes from the CORI and IORI quaternions in the GPMF metadata track. Horizon lock uses the GRAV gravity vector. The Python scripts in `proto/` fit this model to GoPro Player exports.
 
 ## License
