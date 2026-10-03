@@ -383,6 +383,8 @@ void StreamDecoder::run()
     m_Cv.notify_all();
     m_Next = 0;
     int pendingSeek = -1;  // frame we seeked to; frames before it are skipped quickly
+    int retryFrom = -1;    // where the last retry of an overshot seek started
+    int seekBack = 60;     // how far before the target the next retry starts
 
     while (ok)
     {
@@ -410,9 +412,10 @@ void StreamDecoder::run()
             if (m_Stop) break;
         }
 
-        if (m_Next < 0 && pendingSeek >= 0 && target >= pendingSeek)
+        if (pendingSeek >= 0 && target >= pendingSeek && (m_Next < 0 || target - pendingSeek <= kMaxForwardDecode))
         {
-            // still decoding towards an earlier seek target: keep going
+            // still decoding towards an earlier seek target: keep going. The keyframe can be far before the
+            // target (100 fps files have one per 100 frames), and a new seek would only land on it again.
         }
         else if (m_Next < 0 || target < m_Next || target - m_Next > kMaxForwardDecode)
         {
@@ -425,6 +428,8 @@ void StreamDecoder::run()
                 break;
             }
             pendingSeek = target;
+            retryFrom = -1;
+            seekBack = 60;
         }
 
         bool eos = false;
@@ -450,11 +455,16 @@ void StreamDecoder::run()
         }
         if (pendingSeek >= 0 && fr->index > pendingSeek && m_Next < 0)
         {
-            // the seek landed after the target (keyframe search overshot): back up a GOP
-            logf("decoder: seek to %d landed on %d, retrying earlier", pendingSeek, fr->index);
-            int retry = std::max(0, pendingSeek - 60);
-            if (retry == pendingSeek) pendingSeek = -1;
-            else { seek(retry); continue; }
+            // the seek landed after the target (keyframe search overshot): back up, farther on each retry
+            logf("decoder: seek to %d landed on %d, retrying %d earlier", pendingSeek, fr->index, seekBack);
+            if (retryFrom == 0 || pendingSeek == 0) pendingSeek = -1;  // already started at the first frame
+            else
+            {
+                retryFrom = std::max(0, pendingSeek - seekBack);
+                seekBack *= 2;
+                seek(retryFrom);
+                continue;
+            }
         }
         m_Next = fr->index + 1;
         if (pendingSeek >= 0 && fr->index >= pendingSeek) pendingSeek = -1;
