@@ -4,6 +4,9 @@
 //              [--smooth 0.3] [--ss 1] [--gpu cpu|cuda|opencl] [--repeat N] [--dump prefix]
 //              [--bits 8|16] (bits of the PPM)
 //              [--mb shutterAngle] [--mbmax 32] [--panrate deg/frame] [--tiltrate deg/frame] [--fovrate deg/frame]
+//              [--also other.360] (open one more clip first and decode its frame 0; can be repeated)
+//              [--idle seconds] (wait after the last frame, then decode it again and report the time)
+//              [--thumb 1] (as the plugin does for thumbnails: nearest earlier keyframe, no read-ahead)
 // With --count > 1 it renders a sequence and reports timing; %d in --out is replaced by the frame number.
 #include <windows.h>
 
@@ -125,6 +128,9 @@ int main(int argc, char** argv)
     GpuTarget gpu;
     MotionBlurSettings mb;
     double panRate = 0, tiltRate = 0, fovRate = 0;
+    std::vector<std::string> also;
+    int idle = 0;
+    bool thumb = false;
     for (int i = 2; i + 1 < argc; i += 2)
     {
         std::string k = argv[i];
@@ -154,11 +160,24 @@ int main(int argc, char** argv)
         else if (k == "--panrate") panRate = atof(v);
         else if (k == "--tiltrate") tiltRate = atof(v);
         else if (k == "--fovrate") fovRate = atof(v);
+        else if (k == "--also") also.push_back(v);
+        else if (k == "--idle") idle = atoi(v);
+        else if (k == "--thumb") thumb = atoi(v) != 0;
         else { fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
     }
 
     auto t0 = std::chrono::steady_clock::now();
     std::string err;
+    for (const std::string& a : also)
+    {
+        std::shared_ptr<const Nv12Frame> s0, s1;
+        auto c = Clip360::open(utf8ToWide(a), &err);
+        if (!c || !c->fetch(0, s0, s1, &err))
+        {
+            fprintf(stderr, "--also %s failed: %s\n", a.c_str(), err.c_str());
+            return 1;
+        }
+    }
     auto clip = Clip360::open(utf8ToWide(path), &err);
     if (!clip)
     {
@@ -180,9 +199,14 @@ int main(int argc, char** argv)
     for (int i = 0; i < count; ++i)
     {
         int f = frame + i;
+        if (thumb)
+        {
+            f = info.keyframeAtOrBefore(f);
+            printf("thumbnail: frame %d -> keyframe %d\n", frame + i, f);
+        }
         auto a = std::chrono::steady_clock::now();
         std::shared_ptr<const Nv12Frame> s0, s1;
-        if (!clip->fetch(f, s0, s1, &err))
+        if (!clip->fetch(f, s0, s1, &err, !thumb))
         {
             fprintf(stderr, "decode failed at %d: %s\n", f, err.c_str());
             return 1;
@@ -225,6 +249,18 @@ int main(int argc, char** argv)
             size_t p = o.find("%d");
             if (p != std::string::npos) o.replace(p, 2, std::to_string(f));
             writePpm(o, img, w, h, bits);
+        }
+    }
+    if (idle > 0)
+    {
+        Sleep(DWORD(idle) * 1000);
+        for (int f : {frame + count - 1, frame + count})
+        {
+            auto a = std::chrono::steady_clock::now();
+            std::shared_ptr<const Nv12Frame> s0, s1;
+            bool ok = clip->fetch(f, s0, s1, &err);
+            printf("after %d s idle: frame %d %s in %.0f ms\n", idle, f, ok ? "decoded" : err.c_str(),
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count());
         }
     }
     double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();

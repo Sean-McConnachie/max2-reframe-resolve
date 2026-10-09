@@ -32,6 +32,10 @@ namespace {
 
 std::atomic<int> g_RenderCount{0};
 
+// Outputs this narrow are timeline thumbnails. They show the nearest earlier keyframe: that is one frame to
+// decode, where the exact frame can need a full keyframe interval of 8K frames.
+constexpr int kThumbnailMaxWidth = 288;
+
 bool shouldLog()
 {
     int n = g_RenderCount++;
@@ -117,9 +121,11 @@ public:
         double hostFrame = args.srcFrame >= 0 ? double(args.srcFrame) : args.time;
         int frame = resolveSourceFrame(info, hostFrame) + m_FrameOffset->getValueAtTime(args.time);
         frame = std::clamp(frame, 0, info.frames - 1);
+        const bool thumbnail = W <= kThumbnailMaxWidth;
+        if (thumbnail) frame = info.keyframeAtOrBefore(frame);
 
         std::shared_ptr<const Nv12Frame> s0, s1;
-        if (!clip->fetch(frame, s0, s1, &err))
+        if (!clip->fetch(frame, s0, s1, &err, !thumbnail))
         {
             logf("render t=%.2f frame %d: decode failed: %s", args.time, frame, err.c_str());
             passThrough(args, dst.get(), backend, gpuQueue);

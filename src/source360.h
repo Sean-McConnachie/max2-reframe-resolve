@@ -2,7 +2,7 @@
 #pragma once
 
 #include <array>
-#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -24,6 +24,9 @@ struct Source360Info
     std::vector<uint32_t> videoFirstSampleSizes;
     std::vector<std::array<double, 4>> cori, iori;  // w, x, y, z per frame
     std::vector<Vec3> grav;
+    std::vector<int> keyframes;  // 0-based frames that are keyframes, in order; empty means all frames
+    // The last keyframe at or before `frame`: the frame that is quickest to decode near it.
+    int keyframeAtOrBefore(int frame) const;
 };
 
 bool loadSource360(const std::wstring& path, Source360Info& info, std::string* err);
@@ -36,9 +39,9 @@ struct StabSettings
     double smoothSeconds = 0.3;   // heading / orientation smoothing (Gaussian sigma)
     double gravitySeconds = 3.0;  // horizon (gravity) smoothing
 
-    bool operator<(const StabSettings& o) const
+    bool operator==(const StabSettings& o) const
     {
-        return std::tie(stabilize, horizon, directionLock, smoothSeconds, gravitySeconds) <
+        return std::tie(stabilize, horizon, directionLock, smoothSeconds, gravitySeconds) ==
                std::tie(o.stabilize, o.horizon, o.directionLock, o.smoothSeconds, o.gravitySeconds);
     }
 };
@@ -53,11 +56,14 @@ public:
     bool hasData() const { return !m_T.empty(); }
 
 private:
-    const std::vector<Mat3>& table(const StabSettings& s);
+    using Table = std::shared_ptr<const std::vector<Mat3>>;
+    Table table(StabSettings s);
 
     double m_Fps;
     std::vector<Mat3> m_T;     // world0 -> camera
     std::vector<Vec3> m_Grav;  // gravity (up) in world0, per frame
     std::mutex m_Mutex;
-    std::map<StabSettings, std::vector<Mat3>> m_Cache;  // per frame: output view -> world0
+    // Per frame: output view -> world0. Most recently used first. An animated Smoothing gives a new table
+    // for each value, so only a few stay.
+    std::vector<std::pair<StabSettings, Table>> m_Cache;
 };

@@ -26,7 +26,7 @@ struct ContextState
     size_t size[2] = {0, 0};
     cl_mem steps = nullptr;
     int stepCap = 0;
-    std::shared_ptr<const Nv12Frame> last[2];
+    uint64_t last[2] = {0, 0};  // serials of the frames currently on the device
 };
 
 std::mutex g_Mutex;
@@ -97,17 +97,17 @@ bool openclRender(void* queuePtr, const RfParams* p, int n, const std::shared_pt
             if (st.buf[i]) clReleaseMemObject(st.buf[i]);
             st.buf[i] = nullptr;
             st.size[i] = 0;
-            st.last[i].reset();
+            st.last[i] = 0;
             cl_int e;
             st.buf[i] = clCreateBuffer(ctx, CL_MEM_READ_ONLY, bytes, nullptr, &e);
             if (!check(e, "clCreateBuffer", err)) { st.buf[i] = nullptr; return false; }
             st.size[i] = bytes;
         }
-        if (st.last[i] != *frames[i])
+        if (st.last[i] != f.serial)
         {
             if (!check(clEnqueueWriteBuffer(q, st.buf[i], CL_TRUE, 0, bytes, f.data.data(), 0, nullptr, nullptr), "upload", err))
                 return false;
-            st.last[i] = *frames[i];
+            st.last[i] = f.serial;
         }
     }
 

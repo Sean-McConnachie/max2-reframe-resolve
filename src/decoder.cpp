@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -22,9 +23,18 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 constexpr int kPrefetch = 3;          // frames decoded ahead of the last request
-constexpr int kKeepBehind = 2;        // frames kept behind the last request
+constexpr int kKeepBehind = 1;        // frames kept behind the last request
 constexpr int kMaxForwardDecode = 45; // decode forward instead of seeking when the target is this close
-constexpr size_t kMaxCache = 8;
+constexpr size_t kMaxCache = kKeepBehind + 1 + kPrefetch;  // one 8K 10-bit frame is 34 MB
+constexpr size_t kMaxSpare = 1;       // released frame buffers kept for the next frames
+
+// An idle decoder closes its reader (this releases the hardware decoder and its video memory) and keeps
+// only the last requested frame, so a paused clip still draws at once. Later it drops that frame too.
+constexpr auto kCloseFront = std::chrono::seconds(20);
+constexpr auto kCloseBackground = std::chrono::seconds(4);
+constexpr auto kDropAfter = std::chrono::seconds(60);
+
+std::atomic<uint64_t> g_Serial{0};
 
 std::string hrStr(HRESULT hr)
 {
@@ -33,6 +43,20 @@ std::string hrStr(HRESULT hr)
     return b;
 }
 } // namespace
+
+struct StreamDecoder::Pool
+{
+    std::mutex mutex;
+    std::vector<std::vector<uint8_t>> spare;
+    size_t cap = kMaxSpare;
+
+    void setCap(size_t n)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        cap = n;
+        if (spare.size() > cap) spare.resize(cap);
+    }
+};
 
 struct StreamDecoder::Impl
 {
@@ -51,6 +75,7 @@ StreamDecoder::StreamDecoder(const std::wstring& path, uint32_t trackId, uint32_
                              int fpsNum, int fpsDen, int frameCount, int bitDepth)
     : m_Path(path), m_TrackId(trackId), m_FirstSampleSize(firstSampleSize), m_Ordinal(videoOrdinal), m_FpsNum(fpsNum), m_FpsDen(fpsDen), m_Frames(frameCount), m_BitDepth(bitDepth)
 {
+    m_Pool = std::make_shared<Pool>();
     m_Thread = std::thread([this] { run(); });
 }
 
@@ -64,19 +89,48 @@ StreamDecoder::~StreamDecoder()
     if (m_Thread.joinable()) m_Thread.join();
 }
 
-void StreamDecoder::request(int frame)
+void StreamDecoder::request(int frame, bool readAhead)
 {
     {
         std::lock_guard<std::mutex> lock(m_Mutex);
         m_LastWanted = frame;
+        m_ReadAhead = readAhead;
+        m_LastRequest = std::chrono::steady_clock::now();
     }
     m_Cv.notify_all();
 }
 
-std::shared_ptr<const Nv12Frame> StreamDecoder::get(int frame)
+void StreamDecoder::setBackground(bool background)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_Mutex);
+        if (m_Background == background) return;
+        m_Background = background;
+    }
+    m_Cv.notify_all();
+}
+
+std::shared_ptr<Nv12Frame> StreamDecoder::newFrame()
+{
+    // the deleter gives the buffer back to the pool: a new 34 MB allocation for each frame is slow
+    std::shared_ptr<Nv12Frame> f(new Nv12Frame, [pool = m_Pool](Nv12Frame* p) {
+        if (p->data.capacity())
+        {
+            std::lock_guard<std::mutex> lock(pool->mutex);
+            if (pool->spare.size() < pool->cap) pool->spare.push_back(std::move(p->data));
+        }
+        delete p;
+    });
+    f->serial = ++g_Serial;
+    return f;
+}
+
+std::shared_ptr<const Nv12Frame> StreamDecoder::get(int frame, bool readAhead)
 {
     std::unique_lock<std::mutex> lock(m_Mutex);
     m_LastWanted = frame;
+    m_ReadAhead = readAhead;
+    m_LastRequest = std::chrono::steady_clock::now();
     auto it = m_Cache.find(frame);
     if (it != m_Cache.end())
     {
@@ -200,11 +254,16 @@ bool StreamDecoder::openReader()
             m_Error = "Media Foundation cannot open the file (" + hrStr(hr) + ")";
             return false;
         }
-        if (!findStream(d.stream))
+        if (m_StreamIndex < 0)
         {
-            m_Error = "video track " + std::to_string(m_TrackId) + " not found";
-            return false;
+            if (!findStream(d.stream))
+            {
+                m_Error = "video track " + std::to_string(m_TrackId) + " not found";
+                return false;
+            }
+            m_StreamIndex = long(d.stream);
         }
+        d.stream = DWORD(m_StreamIndex);
         d.reader->SetStreamSelection(DWORD(MF_SOURCE_READER_ALL_STREAMS), FALSE);
         d.reader->SetStreamSelection(d.stream, TRUE);
         // 10-bit streams decode to P010 so that no precision is lost; 8-bit streams decode to NV12
@@ -248,7 +307,7 @@ bool StreamDecoder::seek(int frame)
     return SUCCEEDED(hr);
 }
 
-std::shared_ptr<Nv12Frame> StreamDecoder::readFrame(bool& eos)
+template <class F> std::shared_ptr<Nv12Frame> StreamDecoder::readFrame(bool& eos, F&& wantPixels)
 {
     Impl& d = *m_Impl;
     eos = false;
@@ -276,14 +335,27 @@ std::shared_ptr<Nv12Frame> StreamDecoder::readFrame(bool& eos)
         }
         if (!sample) continue;
 
-        auto f = std::make_shared<Nv12Frame>();
+        auto f = newFrame();
         f->index = int(std::llround(double(ts) * m_FpsNum / (double(m_FpsDen) * 1e7)));
+        if (!wantPixels(f->index)) return f;  // a frame on the way to a seek target: nobody will look at it
         f->width = int(d.width);
         f->height = int(d.height);
         auto alloc = [&](int bps) {
             f->bytesPerSample = bps;
             f->pitch = f->width * bps;
-            f->data.resize(size_t(f->pitch) * f->height * 3 / 2);
+            size_t bytes = size_t(f->pitch) * f->height * 3 / 2;
+            {
+                std::lock_guard<std::mutex> lock(m_Pool->mutex);
+                auto& spare = m_Pool->spare;
+                for (size_t i = 0; i < spare.size(); ++i)
+                    if (spare[i].capacity() >= bytes)
+                    {
+                        f->data = std::move(spare[i]);
+                        spare.erase(spare.begin() + i);
+                        break;
+                    }
+            }
+            f->data.resize(bytes);
         };
 
         ComPtr<IMFMediaBuffer> buf;
@@ -332,12 +404,20 @@ std::shared_ptr<Nv12Frame> StreamDecoder::readFrame(bool& eos)
                 return nullptr;
             }
             const uint8_t* src = static_cast<const uint8_t*>(map.pData);
-            for (int y = 0; y < f->height; ++y)
-                std::memcpy(f->data.data() + size_t(y) * f->pitch, src + size_t(y) * map.RowPitch, f->pitch);
             const uint8_t* srcUv = src + size_t(map.RowPitch) * desc.Height;
             uint8_t* dstUv = f->data.data() + size_t(f->pitch) * f->height;
-            for (int y = 0; y < f->height / 2; ++y)
-                std::memcpy(dstUv + size_t(y) * f->pitch, srcUv + size_t(y) * map.RowPitch, f->pitch);
+            if (int(map.RowPitch) == f->pitch)
+            {
+                std::memcpy(f->data.data(), src, size_t(f->pitch) * f->height);
+                std::memcpy(dstUv, srcUv, size_t(f->pitch) * (f->height / 2));
+            }
+            else
+            {
+                for (int y = 0; y < f->height; ++y)
+                    std::memcpy(f->data.data() + size_t(y) * f->pitch, src + size_t(y) * map.RowPitch, f->pitch);
+                for (int y = 0; y < f->height / 2; ++y)
+                    std::memcpy(dstUv + size_t(y) * f->pitch, srcUv + size_t(y) * map.RowPitch, f->pitch);
+            }
             d.ctx->Unmap(d.staging.Get(), 0);
         }
         else
@@ -385,10 +465,14 @@ void StreamDecoder::run()
     int pendingSeek = -1;  // frame we seeked to; frames before it are skipped quickly
     int retryFrom = -1;    // where the last retry of an overshot seek started
     int seekBack = 60;     // how far before the target the next retry starts
+    bool open = ok;        // false while the reader is closed because nobody asked for frames
+    // m_LastRequest at the time the reader closed: read-ahead stays off until there is a new request
+    auto quietSince = std::chrono::steady_clock::time_point::min();
 
     while (ok)
     {
         int target = -1;
+        bool close = false;
         {
             std::unique_lock<std::mutex> lock(m_Mutex);
             auto pick = [&] {
@@ -403,13 +487,58 @@ void StreamDecoder::run()
                 }
                 if (bestAhead != INT_MAX) target = bestAhead;
                 else if (best != INT_MAX) target = best;
-                else if (m_LastWanted >= 0)
-                    for (int f = m_LastWanted; f <= m_LastWanted + kPrefetch && f < m_Frames; ++f)
+                else if (m_LastWanted >= 0 && m_LastRequest != quietSince)
+                    for (int f = m_LastWanted; f <= m_LastWanted + (m_ReadAhead ? kPrefetch : 0) && f < m_Frames; ++f)
                         if (!m_Cache.count(f)) { target = f; break; }
                 return target >= 0;
             };
-            m_Cv.wait(lock, [&] { return m_Stop || pick(); });
+            while (!m_Stop && !pick())
+            {
+                auto now = std::chrono::steady_clock::now();
+                auto closeAt = m_LastRequest + (m_Background ? kCloseBackground : kCloseFront);
+                auto dropAt = m_LastRequest + kDropAfter;
+                if (open && now >= closeAt)
+                {
+                    close = true;
+                    break;
+                }
+                if (open) m_Cv.wait_until(lock, closeAt);
+                else if (now < dropAt) m_Cv.wait_until(lock, dropAt);
+                else
+                {
+                    m_Cache.clear();
+                    m_Cv.wait(lock);
+                }
+            }
             if (m_Stop) break;
+            if (close)
+            {
+                quietSince = m_LastRequest;
+                for (auto it = m_Cache.begin(); it != m_Cache.end();)
+                    it = it->first == m_LastWanted ? std::next(it) : m_Cache.erase(it);
+            }
+        }
+        if (close)
+        {
+            m_Pool->setCap(0);
+            m_Impl = std::make_unique<Impl>();
+            open = false;
+            continue;
+        }
+        if (!open)
+        {
+            m_Pool->setCap(kMaxSpare);
+            if (!openReader())
+            {
+                std::lock_guard<std::mutex> lock(m_Mutex);
+                m_Failed = true;
+                logf("decoder: %s", m_Error.c_str());
+                m_Cv.notify_all();
+                break;
+            }
+            open = true;
+            m_Next = -1;
+            pendingSeek = -1;
         }
 
         if (pendingSeek >= 0 && target >= pendingSeek && (m_Next < 0 || target - pendingSeek <= kMaxForwardDecode))
@@ -433,7 +562,10 @@ void StreamDecoder::run()
         }
 
         bool eos = false;
-        auto fr = readFrame(eos);
+        auto fr = readFrame(eos, [&](int index) {
+            std::lock_guard<std::mutex> lock(m_Mutex);
+            return m_Wanted.count(index) || (index >= m_LastWanted - kKeepBehind && index <= m_LastWanted + kPrefetch);
+        });
         if (!fr)
         {
             std::lock_guard<std::mutex> lock(m_Mutex);
@@ -468,6 +600,8 @@ void StreamDecoder::run()
         }
         m_Next = fr->index + 1;
         if (pendingSeek >= 0 && fr->index >= pendingSeek) pendingSeek = -1;
+
+        if (fr->data.empty()) continue;
 
         std::lock_guard<std::mutex> lock(m_Mutex);
         int lw = m_LastWanted;

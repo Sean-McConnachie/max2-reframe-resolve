@@ -13,7 +13,9 @@
 
 namespace {
 
-constexpr size_t kMaxOpenClips = 3;
+// Two clips cover cuts and dissolves. Each open 8K clip costs about 1 GB of system memory and 450 MB of
+// video memory until its decoders close.
+constexpr size_t kMaxOpenClips = 2;
 
 struct Registry
 {
@@ -26,6 +28,12 @@ Registry& registry()
 {
     static Registry* r = new Registry();  // intentionally leaked: avoid teardown order issues at DLL unload
     return *r;
+}
+
+// The first clip is the one in use; the others release their decoders sooner. Call with the registry locked.
+void rankClips(Registry& r)
+{
+    for (auto it = r.clips.begin(); it != r.clips.end(); ++it) it->second->setBackground(it != r.clips.begin());
 }
 
 std::wstring normalize(const std::wstring& p)
@@ -65,7 +73,11 @@ std::shared_ptr<Clip360> Clip360::open(const std::wstring& path, std::string* er
         for (auto it = r.clips.begin(); it != r.clips.end(); ++it)
             if (it->first == key)
             {
-                r.clips.splice(r.clips.begin(), r.clips, it);
+                if (it != r.clips.begin())
+                {
+                    r.clips.splice(r.clips.begin(), r.clips, it);
+                    rankClips(r);
+                }
                 return it->second;
             }
         auto f = r.failures.find(key);
@@ -89,11 +101,23 @@ std::shared_ptr<Clip360> Clip360::open(const std::wstring& path, std::string* er
          wideToUtf8(path).c_str(), info.frames, info.fpsNum, info.fpsDen, info.streamW, info.streamH, info.bitDepth,
          (long long)info.tcStartFrame, info.cori.size(), info.iori.size(), info.grav.size());
     auto clip = std::make_shared<Clip360>(info);
+    // Clips that leave the list close their decoders when the last user lets go. That can take a moment,
+    // so it must occur after the registry is unlocked: `evicted` is destroyed last.
+    std::vector<std::shared_ptr<Clip360>> evicted;
     std::lock_guard<std::mutex> lock(r.mutex);
     for (auto& c : r.clips)
-        if (c.first == key) return c.second;  // another thread won the race
+        if (c.first == key)
+        {
+            evicted.push_back(std::move(clip));
+            return c.second;  // another thread won the race
+        }
     r.clips.emplace_front(key, clip);
-    while (r.clips.size() > kMaxOpenClips) r.clips.pop_back();  // decoders close when the last user lets go
+    while (r.clips.size() > kMaxOpenClips)
+    {
+        evicted.push_back(std::move(r.clips.back().second));
+        r.clips.pop_back();
+    }
+    rankClips(r);
     return clip;
 }
 
@@ -102,15 +126,25 @@ Clip360::Clip360(const Source360Info& info) : m_Info(info), m_Stab(info)
     for (int i = 0; i < 2; ++i)
         m_Dec[i] = std::make_unique<StreamDecoder>(info.path, info.videoTrackIds[i], info.videoFirstSampleSizes[i], i,
                                                  info.fpsNum, info.fpsDen, info.frames, info.bitDepth);
+    // the stabilizer has its own tables: the raw orientation samples are not necessary after this
+    std::vector<std::array<double, 4>>().swap(m_Info.cori);
+    std::vector<std::array<double, 4>>().swap(m_Info.iori);
+    std::vector<Vec3>().swap(m_Info.grav);
 }
 
-bool Clip360::fetch(int frame, std::shared_ptr<const Nv12Frame>& s0, std::shared_ptr<const Nv12Frame>& s1, std::string* err)
+void Clip360::setBackground(bool background)
+{
+    for (auto& d : m_Dec) d->setBackground(background);
+}
+
+bool Clip360::fetch(int frame, std::shared_ptr<const Nv12Frame>& s0, std::shared_ptr<const Nv12Frame>& s1, std::string* err,
+                    bool readAhead)
 {
     frame = std::clamp(frame, 0, std::max(0, m_Info.frames - 1));
-    m_Dec[0]->request(frame);
-    m_Dec[1]->request(frame);
-    s0 = m_Dec[0]->get(frame);
-    s1 = m_Dec[1]->get(frame);
+    m_Dec[0]->request(frame, readAhead);
+    m_Dec[1]->request(frame, readAhead);
+    s0 = m_Dec[0]->get(frame, readAhead);
+    s1 = m_Dec[1]->get(frame, readAhead);
     if (s0 && s1) return true;
     if (err) *err = !s0 ? m_Dec[0]->error() : m_Dec[1]->error();
     return false;

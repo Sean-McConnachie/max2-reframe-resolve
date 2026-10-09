@@ -133,15 +133,29 @@ std::vector<Vec3> gaussSmooth(const std::vector<Vec3>& v, double sigma)
     for (int i = 0; i < n; ++i)
     {
         Vec3 a;
-        for (int k = -rad; k <= rad; ++k) a = a + v[mirrorIndex(i + k, n)] * w[k + rad];
+        if (i >= rad && i + rad < n)  // away from the ends, no mirror arithmetic is necessary
+        {
+            const Vec3* c = v.data() + i;
+            for (int k = -rad; k <= rad; ++k) a = a + c[k] * w[k + rad];
+        }
+        else
+            for (int k = -rad; k <= rad; ++k) a = a + v[mirrorIndex(i + k, n)] * w[k + rad];
         out[i] = a;
     }
     return out;
 }
 
+constexpr size_t kMaxTables = 4;
+
 const Mat3 kM = [] { Mat3 m; m.m[0][0] = -1; m.m[2][2] = -1; return m; }();  // GPMF orientation frame -> camera frame
 
 } // namespace
+
+int Source360Info::keyframeAtOrBefore(int frame) const
+{
+    auto it = std::upper_bound(keyframes.begin(), keyframes.end(), frame);
+    return it == keyframes.begin() ? frame : *(it - 1);
+}
 
 bool loadSource360(const std::wstring& path, Source360Info& info, std::string* err)
 {
@@ -173,6 +187,9 @@ bool loadSource360(const std::wstring& path, Source360Info& info, std::string* e
     info.streamW = v0->width;
     info.streamH = v0->height;
     info.bitDepth = v0->bitDepth;
+    for (uint32_t s : v0->sync)
+        if (s >= 1) info.keyframes.push_back(int(s - 1));
+    std::sort(info.keyframes.begin(), info.keyframes.end());
     if (v0->times.size() >= 2 && v0->timescale)
     {
         info.fpsNum = int(v0->timescale);
@@ -219,11 +236,19 @@ Stabilizer::Stabilizer(const Source360Info& info) : m_Fps(info.fps())
     }
 }
 
-const std::vector<Mat3>& Stabilizer::table(const StabSettings& s)
+Stabilizer::Table Stabilizer::table(StabSettings s)
 {
+    // settings that have no effect must not give a second table
+    if (s.directionLock) s.smoothSeconds = 0;
+    if (!s.horizon) s.gravitySeconds = 0;
+
     std::lock_guard<std::mutex> lock(m_Mutex);
-    auto it = m_Cache.find(s);
-    if (it != m_Cache.end()) return it->second;
+    for (size_t i = 0; i < m_Cache.size(); ++i)
+        if (m_Cache[i].first == s)
+        {
+            if (i) std::rotate(m_Cache.begin(), m_Cache.begin() + i, m_Cache.begin() + i + 1);
+            return m_Cache.front().second;
+        }
 
     int n = int(m_T.size());
     std::vector<Vec3> fwd(n), upc(n);
@@ -249,13 +274,16 @@ const std::vector<Mat3>& Stabilizer::table(const StabSettings& s)
         Vec3 x = u.cross(z);
         out[i] = Mat3::cols(x, u, z);  // output view -> world0
     }
-    return m_Cache.emplace(s, std::move(out)).first->second;
+    if (m_Cache.size() >= kMaxTables) m_Cache.pop_back();
+    m_Cache.emplace(m_Cache.begin(), s, std::make_shared<const std::vector<Mat3>>(std::move(out)));
+    return m_Cache.front().second;
 }
 
 Mat3 Stabilizer::rotation(int frame, const StabSettings& s, double subFrame)
 {
     if (!s.stabilize || m_T.empty()) return Mat3::identity();
-    const auto& e = table(s);
+    Table tbl = table(s);
+    const auto& e = *tbl;
     int n = int(e.size());
     frame = std::clamp(frame, 0, n - 1);
     // The pixels come from `frame`, so the camera orientation is that frame's; only the virtual (output)

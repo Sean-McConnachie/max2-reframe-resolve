@@ -34,7 +34,7 @@ struct DeviceState
     size_t size[2] = {0, 0};
     RfParams* steps = nullptr;
     int stepCap = 0;
-    std::shared_ptr<const Nv12Frame> last[2];  // frames currently on the device (kept alive so pointers stay unique)
+    uint64_t last[2] = {0, 0};  // serials of the frames currently on the device
 };
 
 std::mutex g_Mutex;
@@ -68,15 +68,15 @@ bool cudaRender(void* streamPtr, const RfParams* p, int n, const std::shared_ptr
             if (st.buf[i]) cudaFree(st.buf[i]);
             st.buf[i] = nullptr;
             st.size[i] = 0;
-            st.last[i].reset();
+            st.last[i] = 0;
             if (!check(cudaMalloc(&st.buf[i], bytes), "cudaMalloc", err)) return false;
             st.size[i] = bytes;
         }
-        if (st.last[i] != *frames[i])
+        if (st.last[i] != f.serial)
         {
             if (!check(cudaMemcpyAsync(st.buf[i], f.data.data(), bytes, cudaMemcpyHostToDevice, stream), "upload", err))
                 return false;
-            st.last[i] = *frames[i];
+            st.last[i] = f.serial;
         }
     }
     if (st.stepCap < n)

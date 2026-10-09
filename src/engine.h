@@ -43,11 +43,15 @@ public:
     static std::shared_ptr<Clip360> open(const std::wstring& path, std::string* err);
 
     const Source360Info& info() const { return m_Info; }
-    // Decode both lens streams for a frame (in parallel).
-    bool fetch(int frame, std::shared_ptr<const Nv12Frame>& s0, std::shared_ptr<const Nv12Frame>& s1, std::string* err);
+    // Decode both lens streams for a frame (in parallel). Without readAhead the decoders do not continue
+    // with the next frames.
+    bool fetch(int frame, std::shared_ptr<const Nv12Frame>& s0, std::shared_ptr<const Nv12Frame>& s1, std::string* err,
+               bool readAhead = true);
     // subFrame: time offset of the virtual camera within the frame, in frames (for motion blur).
     ViewParams view(int frame, const RenderSettings& rs, double subFrame = 0);
     bool hasGyro() const { return m_Stab.hasData(); }
+    // Background clips (not the most recently used one) release their decoders sooner when they are idle.
+    void setBackground(bool background);
 
     explicit Clip360(const Source360Info& info);
 

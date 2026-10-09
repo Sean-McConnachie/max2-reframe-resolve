@@ -2,6 +2,7 @@
 // frame cache and read-ahead on a worker thread.
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <map>
 #include <memory>
@@ -15,6 +16,7 @@
 struct Nv12Frame
 {
     int index = -1;
+    uint64_t serial = 0;         // unique per decoded frame, never 0
     int width = 0, height = 0;
     int bytesPerSample = 1;      // 1: NV12 (8-bit). 2: P010 (10-bit, in the high bits of little-endian 16-bit words)
     int pitch = 0;               // bytes per row, both planes
@@ -32,19 +34,24 @@ public:
                   int fpsDen, int frameCount, int bitDepth);
     ~StreamDecoder();
 
-    // Request a frame and start decoding it (non-blocking).
-    void request(int frame);
+    // Request a frame and start decoding it (non-blocking). Without readAhead the decoder stops after
+    // this frame (for single pictures such as thumbnails).
+    void request(int frame, bool readAhead = true);
     // Blocking fetch. Returns null on failure (see error()).
-    std::shared_ptr<const Nv12Frame> get(int frame);
+    std::shared_ptr<const Nv12Frame> get(int frame, bool readAhead = true);
     std::string error();
     bool hardware() const { return m_Hardware; }
+    // A background decoder (not the most recently used clip) closes its reader sooner when it is idle.
+    void setBackground(bool background);
 
 private:
     void run();
     bool openReader();
     bool findStream(unsigned long& stream);
     bool seek(int frame);
-    std::shared_ptr<Nv12Frame> readFrame(bool& eos);
+    // Frames for which wantPixels is false come back with the index only (no read-back, no data).
+    template <class F> std::shared_ptr<Nv12Frame> readFrame(bool& eos, F&& wantPixels);
+    std::shared_ptr<Nv12Frame> newFrame();
 
     std::wstring m_Path;
     uint32_t m_TrackId;
@@ -57,15 +64,23 @@ private:
     std::condition_variable m_Cv;
     std::multiset<int> m_Wanted;
     int m_LastWanted = -1;
+    std::chrono::steady_clock::time_point m_LastRequest = std::chrono::steady_clock::now();
+    bool m_Background = false;
+    bool m_ReadAhead = true;
     std::map<int, std::shared_ptr<const Nv12Frame>> m_Cache;
     std::string m_Error;
     bool m_Failed = false;
     bool m_Stop = false;
     bool m_Hardware = false;
 
+    // Buffers of released frames, for the next frames. Frames can outlive the decoder, so they share it.
+    struct Pool;
+    std::shared_ptr<Pool> m_Pool;
+
     // worker-thread state
     struct Impl;
     std::unique_ptr<Impl> m_Impl;
+    long m_StreamIndex = -1;  // Media Foundation stream of this track, known after the first open
     int m_Next = 0;  // index of the frame the reader will return next (-1 unknown)
     std::thread m_Thread;
 };
