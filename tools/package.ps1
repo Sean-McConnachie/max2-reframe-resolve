@@ -1,5 +1,5 @@
 # Builds a release zip in dist\: Max2Reframe-<version>-win64.zip
-param([string]$Version = '1.2.4')
+param([string]$Version = '1.3.0')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 
@@ -14,7 +14,8 @@ New-Item -ItemType Directory -Force "$stage\Max2Reframe.ofx.bundle\Contents\Win6
 
 Copy-Item "$root\build\Max2ReframeCore.dll" $stage
 Copy-Item "$root\build\Max2Reframe.ofx.bundle\Contents\Win64\Max2Reframe.ofx" "$stage\Max2Reframe.ofx.bundle\Contents\Win64\"
-Copy-Item "$root\build\Max2Prepare.exe", "$root\tools\resolve\Import GoPro 360.lua", "$root\tools\resolve\Import GoPro 360 Folder Tree.lua" $stage
+Copy-Item "$root\build\Max2Prepare.exe", "$root\build\Max2Convert.exe" $stage
+Copy-Item "$root\tools\resolve\Import GoPro 360.lua", "$root\tools\resolve\Import GoPro 360 Folder Tree.lua", "$root\tools\resolve\Use 360 Files for GoPro Exports.lua" $stage
 Copy-Item "$root\install.ps1", "$root\tools\Install.bat", "$root\tools\Uninstall.bat", "$root\LICENSE", "$root\THIRD-PARTY-NOTICES.md" $stage
 Copy-Item "$root\tools\link-mp4.ps1" $stage
 

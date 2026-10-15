@@ -54,7 +54,11 @@ On an RTX 3060 laptop GPU, one UHD frame takes approximately 8 ms to render with
 5. When Windows asks for administrator permission, click **Yes**.
 6. Start DaVinci Resolve.
 
-The installer puts a small loader in `C:\Program Files\Common Files\OFX\Plugins`. Only this step needs administrator permission. The plugin itself goes into `%LOCALAPPDATA%\Max2Reframe`. Updates replace only this folder. The installer also adds **Prepare GoPro 360 for Resolve** to the Explorer menu of folders and drives, and two scripts to the Resolve **Workspace > Scripts** menu.
+The installer puts a small loader in `C:\Program Files\Common Files\OFX\Plugins`. Only this step needs administrator permission. The plugin itself goes into `%LOCALAPPDATA%\Max2Reframe`. Updates replace only this folder. The installer also adds these items:
+
+- **Prepare GoPro 360 for Resolve** in the Explorer menu of folders and drives.
+- **Convert GoPro Reframe to Max2 Reframe** in the Explorer menu of timeline files (`.drt`).
+- Three scripts in the Resolve **Workspace > Scripts** menu.
 
 If Windows SmartScreen stops `Install.bat`, click **More info**, then click **Run anyway**.
 
@@ -97,6 +101,45 @@ A `.360` file has two sound streams: stereo sound and 4-channel ambisonic (360-d
 3. Drag **Max2 Reframe** onto the clip.
 4. In the Inspector, set the view and the stabilization.
 
+### Convert a timeline made with GoPro Reframe
+
+You can change a timeline that uses GoPro Player exports and the GoPro Reframe plugin to Max2 Reframe. The converter keeps the cuts, trims, transitions, other effects and the views, with their keyframes.
+
+1. In Resolve, open the timeline.
+2. Select **File > Export > Timeline**, then save the `.drt` file.
+3. In Explorer, right-click the `.drt` file. On Windows 11, then select **Show more options**.
+4. Select **Convert GoPro Reframe to Max2 Reframe**.
+5. Read the message. The converter writes `<name> (Max2 Reframe).drt` next to the original file. It does not change the original file.
+6. In Resolve, select **File > Import > Timeline**, then select the new file.
+
+The new timeline has the name of the old one with "(Max2 Reframe)" added. The converter changes only the clips with a GoPro Reframe Fusion composition:
+
+- It removes the Fusion composition.
+- It adds Max2 Reframe with the same Pan, Tilt and Roll. GoPro calls Roll "Dutch".
+- It changes Zoom and Lens Curve to the Field of View and Lens Curvature that give the nearest picture. In a UHD frame, the picture is usually within a few pixels of the GoPro picture. Near the edges of very wide views (Field of View more than approximately 135 degrees), the difference can be up to approximately 1% of the frame width.
+- It changes GoPro keyframes to Max2 Reframe keyframes. A GoPro ease becomes more keyframes, so the movement stays the same.
+- It keeps Motion Blur and Shutter Angle.
+- It uses the default stabilization of Max2 Reframe. This is near to the GoPro Player export, but the heading can be different by approximately 1 to 3 degrees when the camera turns.
+
+The converted clips still use the GoPro Player exports. Max2 Reframe reads the `.360` file with the same name, in the folder of the export or in a folder next to it. For example, it reads `MAX2\GS011840.360` for `MAX2_equi\GS011840.mp4`. The `.360` file must have the same number of frames and the same start timecode as the export.
+
+The converter does not change a clip in these conditions. The message lists these clips.
+
+- The Fusion composition has other nodes.
+- The clip uses GoPro settings that Max2 Reframe does not have: Second Camera, an X or Y offset, a 360 rotation (yaw, pitch, roll), or SuperView/HyperView.
+- The GoPro output size is not the timeline size.
+- No matching `.360` file is near the export.
+
+#### Use the .360 files and delete the exports
+
+When the new timeline is correct, you can replace the exports with the `.360` files. Then you can delete the exports.
+
+1. Prepare the folders with the `.360` files. See [Prepare the folder](#prepare-the-folder).
+2. Delete the old timelines that use GoPro Reframe, or convert them too. The script does not change an export that a timeline uses with GoPro Reframe, because that timeline would then show the wrong picture.
+3. Select **Workspace > Scripts > Use 360 Files for GoPro Exports**.
+
+Each export clip in the Media Pool then uses its `.360` file. The clips stay in all timelines with the same trims. The script uses the list of exports that the converter made. It writes what it did to **Workspace > Console**.
+
 ## Settings
 
 <img src="docs/images/inspector.png" alt="The Max2 Reframe settings in the Resolve Inspector" width="400">
@@ -125,6 +168,9 @@ A `.360` file has two sound streams: stereo sound and 4-channel ambisonic (360-d
 - **The folder dialog opens again with "Not prepared" in its title.** Prepare the folder in Explorer, then select it again in the dialog.
 - **The Prepare message says that Windows did not allow the symbolic links.** Click **Yes** in the permission prompt. Or turn on Developer Mode in Windows Settings (**For developers**). Then prepare the folder again.
 - **The script does not import the clips.** A script in Resolve Free cannot show messages. The scripts write their messages to `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\logs\ResolveDebug.txt`.
+- **Convert GoPro Reframe to Max2 Reframe is not in the Explorer menu.** Run `Install.bat` again. On Windows 11, select **Show more options** first.
+- **A converted clip shows the full 360 picture, not the reframed view.** Max2 Reframe did not find the `.360` file of the export. Put the `.360` file in a folder next to the export folder. Or set **Source File** in the Inspector.
+- **Use 360 Files for GoPro Exports does not change a clip.** Read its messages in **Workspace > Console**. A timeline that still uses GoPro Reframe with the clip stops the change. A folder that is not prepared also stops it.
 - **Other problems.** Read the log file at `%LOCALAPPDATA%\Max2Reframe\max2reframe.log`.
 
 ## Build from source
@@ -135,14 +181,25 @@ You need Visual Studio 2022 with the C++ tools and the CUDA Toolkit 12.
 2. Close DaVinci Resolve.
 3. Run `powershell -ExecutionPolicy Bypass -File install.ps1`.
 
-`build.bat` also makes `build\Max2Prepare.exe` from `tools\prepare360.cpp`. `tools\package.ps1` makes the release zip in `dist\`. `build\max2render.exe` renders frames without Resolve. The comment at the top of `tools\max2render.cpp` lists its options.
+`build.bat` also makes these programs:
+
+- `build\Max2Prepare.exe` from `tools\prepare360.cpp`.
+- `build\Max2Convert.exe` (the timeline converter) from `tools\convert\`.
+- `build\max2render.exe`, which renders frames without Resolve. The comment at the top of `tools\max2render.cpp` lists its options.
+- `build\convert_test.exe` and `build\ofxhost.exe`, for the converter tests.
+
+`tools\package.ps1` makes the release zip in `dist\`.
+
+`python tools\test\test_convert.py --data <folder>` tests the converter and the `.360` search. It needs a timeline file made with GoPro Reframe, the clips of that timeline, and Python with numpy, opencv-python and zstandard. The comment at the top of the file lists what it needs. With `--pictures`, it also compares pictures with the GoPro Reframe plugin, if that plugin is installed.
 
 ## How it works
 
 - In each render call, Resolve gives the path of the source file. The plugin decodes this file itself, because Resolve gives Edit page effects only timeline resolution.
 - A Max 2 `.360` file has two HEVC streams in the equi-angular cubemap (EAC) layout of GoPro. An 8-bit stream is 5888 x 1920. A 10-bit stream is 5952 x 1920, and the decoder supplies it as P010. CUDA, OpenCL and the CPU use one shared sampling function in `src/reframe_kernel.h`.
 - The camera orientation comes from the CORI and IORI quaternions in the GPMF metadata track. Horizon lock uses the GRAV gravity vector. The Python scripts in `proto/` fit this model to GoPro Player exports.
+- A `.drt` file is a zip file with XML. Each clip keeps its Edit page effects as a protocol buffer, which is often zstd compressed, and its Fusion composition as zlib compressed Lua text. The converter reads the GoPro Reframe node and its curves from the composition. It then writes Max2 Reframe in the form that Resolve uses.
+- GoPro Reframe turns the view by Pan, then Tilt, then rolls it by Dutch, as Max2 Reframe does. Only the lens is different. `tools\convert\gopro_view.cpp` models the GoPro lens. This model agrees with the GoPro plugin to 0.01 degrees. The converter then finds the Max2 lens that puts each direction nearest to where GoPro puts it.
 
 ## License
 
-MIT. See `LICENSE`. The OpenFX files in `third_party/openfx` use the BSD-3-Clause license. See `THIRD-PARTY-NOTICES.md`.
+MIT. See `LICENSE`. The OpenFX files in `third_party/openfx` and the zstd decoder in `third_party/zstd` use BSD licenses. See `THIRD-PARTY-NOTICES.md`.

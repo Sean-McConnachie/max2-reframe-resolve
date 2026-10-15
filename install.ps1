@@ -4,9 +4,11 @@
 #  - A tiny loader goes into Resolve's standard plugin folder,
 #    C:\Program Files\Common Files\OFX\Plugins\Max2Reframe.ofx.bundle, and forwards to the core. Installing or
 #    changing the loader needs admin (one UAC prompt); it rarely changes.
-#  - The "Import GoPro 360" scripts go into Resolve's Scripts menu (Workspace > Scripts).
+#  - The "Import GoPro 360" and "Use 360 Files for GoPro Exports" scripts go into Resolve's Scripts menu
+#    (Workspace > Scripts).
 #  - Max2Prepare.exe goes to %LOCALAPPDATA%\Max2Reframe, with "Prepare GoPro 360 for Resolve" in the Explorer menu of
 #    folders and drives. Resolve 21.1 Free menu scripts cannot create files, so this tool makes the .mp4 links.
+#  - Max2Convert.exe goes there too, with "Convert GoPro Reframe to Max2 Reframe" in the Explorer menu of .drt files.
 # Restart Resolve afterwards. Uninstall: .\install.ps1 -Uninstall
 param([switch]$Uninstall)
 $ErrorActionPreference = 'Stop'
@@ -17,9 +19,11 @@ $core = Join-Path $coreDir 'Max2ReframeCore.dll'
 $bundle = 'C:\Program Files\Common Files\OFX\Plugins\Max2Reframe.ofx.bundle'
 $stub = Join-Path $bundle 'Contents\Win64\Max2Reframe.ofx'
 $scriptDir = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility'
-$importScripts = 'Import GoPro 360.lua', 'Import GoPro 360 Folder Tree.lua'
+$importScripts = 'Import GoPro 360.lua', 'Import GoPro 360 Folder Tree.lua', 'Use 360 Files for GoPro Exports.lua'
 $prepare = Join-Path $base 'Max2Prepare.exe'
 $verbKeys = 'Directory', 'Directory\Background', 'Drive' | ForEach-Object { "HKCU:\Software\Classes\$_\shell\Max2Reframe.Prepare" }
+$convert = Join-Path $base 'Max2Convert.exe'
+$convertKey = 'HKCU:\Software\Classes\SystemFileAssociations\.drt\shell\Max2Reframe.Convert'
 # Left by earlier versions: the Python script and the PowerShell helper of the old import script.
 $oldScripts = Join-Path $scriptDir 'Import GoPro 360.py'
 $oldHelperDir = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\Max2Reframe'
@@ -30,11 +34,13 @@ if (Test-Path (Join-Path $PSScriptRoot 'Max2ReframeCore.dll')) {
     $builtStub = Join-Path $PSScriptRoot 'Max2Reframe.ofx.bundle\Contents\Win64\Max2Reframe.ofx'
     $srcScripts = $importScripts | ForEach-Object { Join-Path $PSScriptRoot $_ }
     $srcPrepare = Join-Path $PSScriptRoot 'Max2Prepare.exe'
+    $srcConvert = Join-Path $PSScriptRoot 'Max2Convert.exe'
 } else {
     $srcCore = Join-Path $PSScriptRoot 'build\Max2ReframeCore.dll'
     $builtStub = Join-Path $PSScriptRoot 'build\Max2Reframe.ofx.bundle\Contents\Win64\Max2Reframe.ofx'
     $srcScripts = $importScripts | ForEach-Object { Join-Path $PSScriptRoot "tools\resolve\$_" }
     $srcPrepare = Join-Path $PSScriptRoot 'build\Max2Prepare.exe'
+    $srcConvert = Join-Path $PSScriptRoot 'build\Max2Convert.exe'
 }
 
 # Resolve keeps its plugin cache in memory and rewrites it on exit, so changes made while it runs are lost.
@@ -67,8 +73,8 @@ $isJunction = (Test-Path $bundle) -and ((Get-Item $bundle -Force).Attributes -ba
 
 if ($Uninstall) {
     Remove-Locked $core
-    Remove-Item ($importScripts | ForEach-Object { Join-Path $scriptDir $_ }), $oldScripts, $prepare -ErrorAction SilentlyContinue
-    Remove-Item $verbKeys, $oldHelperDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item ($importScripts | ForEach-Object { Join-Path $scriptDir $_ }), $oldScripts, $prepare, $convert -ErrorAction SilentlyContinue
+    Remove-Item $verbKeys, $convertKey, $oldHelperDir -Recurse -Force -ErrorAction SilentlyContinue
     if (Test-Path $bundle) { Invoke-Elevated "rmdir /s /q `"$bundle`"" | Out-Null }
     Write-Host "Uninstalled. Restart DaVinci Resolve."
     return
@@ -110,6 +116,13 @@ foreach ($key in $verbKeys) {
     Set-Item $key 'Prepare GoPro 360 for Resolve'
     Set-Item "$key\command" "`"$prepare`" `"%V`""
 }
+
+# "Convert GoPro Reframe to Max2 Reframe" in the Explorer menu of timeline files (.drt) that Resolve exports.
+Copy-Item $srcConvert $convert -Force
+Unblock-File $convert
+New-Item "$convertKey\command" -Force | Out-Null
+Set-Item $convertKey 'Convert GoPro Reframe to Max2 Reframe'
+Set-Item "$convertKey\command" "`"$convert`" `"%1`""
 
 # Resolve remembers plugins that failed to load and will not retry them; drop our entries so it rescans.
 $cache = Join-Path $env:APPDATA 'Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml'

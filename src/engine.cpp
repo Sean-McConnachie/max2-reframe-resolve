@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 
+#include "export360.h"
 #include "log.h"
 
 namespace {
@@ -22,6 +23,7 @@ struct Registry
     std::mutex mutex;
     std::list<std::pair<std::wstring, std::shared_ptr<Clip360>>> clips;  // most recently used first
     std::map<std::wstring, std::pair<std::string, std::chrono::steady_clock::time_point>> failures;
+    std::map<std::wstring, std::wstring> exports;  // GoPro Player export -> the .360 file it was made from
 };
 
 Registry& registry()
@@ -68,6 +70,7 @@ std::shared_ptr<Clip360> Clip360::open(const std::wstring& path, std::string* er
 {
     Registry& r = registry();
     std::wstring key = normalize(path);
+    std::wstring source;  // set if `path` is a GoPro Player export with a known .360 file
     {
         std::lock_guard<std::mutex> lock(r.mutex);
         for (auto it = r.clips.begin(); it != r.clips.end(); ++it)
@@ -86,11 +89,26 @@ std::shared_ptr<Clip360> Clip360::open(const std::wstring& path, std::string* er
             if (err) *err = f->second.first;
             return nullptr;
         }
+        auto x = r.exports.find(key);
+        if (x != r.exports.end()) source = x->second;
     }
+    if (!source.empty()) return open(source, err);
     Source360Info info;
     std::string e;
     if (!loadSource360(path, info, &e))
     {
+        // A clip made by the GoPro Player exporter: use the .360 file it came from, if it is near it.
+        std::string why;
+        if (findSource360ForExport(path, source, &why))
+        {
+            logf("open %s: GoPro Player export, using %s", wideToUtf8(path).c_str(), wideToUtf8(source).c_str());
+            {
+                std::lock_guard<std::mutex> lock(r.mutex);
+                r.exports[key] = source;
+            }
+            return open(source, err);
+        }
+        e += "; " + why;
         logf("open %s: %s", wideToUtf8(path).c_str(), e.c_str());
         std::lock_guard<std::mutex> lock(r.mutex);
         r.failures[key] = {e, std::chrono::steady_clock::now()};

@@ -11,6 +11,7 @@ set OBJ=build\obj
 set GEN=build\gen
 if not exist %OBJ%\sdk mkdir %OBJ%\sdk
 if not exist %OBJ%\core mkdir %OBJ%\core
+if not exist %OBJ%\convert mkdir %OBJ%\convert
 
 set CFLAGS=/nologo /O2 /EHsc /MD /std:c++17 /W3 /DWIN32 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS /Ithird_party\openfx\include /Ithird_party\openfx\Support\include /Isrc /I%GEN% /I"%CUDA_PATH%\include"
 set LIBS=mfplat.lib mfreadwrite.lib mfuuid.lib d3d11.lib dxgi.lib ole32.lib propsys.lib user32.lib shell32.lib "%CUDA_PATH%\lib\x64\cudart_static.lib" "%CUDA_PATH%\lib\x64\OpenCL.lib"
@@ -29,7 +30,7 @@ rem CUDA kernels: native code for Turing/Ampere/Ada plus PTX for newer GPUs
 
 cl %CFLAGS% /c src\*.cpp /Fo%OBJ%\core\ || exit /b 1
 
-set CORE=%OBJ%\core\mp4.obj %OBJ%\core\source360.obj %OBJ%\core\decoder.obj %OBJ%\core\reproject.obj %OBJ%\core\engine.obj %OBJ%\core\log.obj %OBJ%\core\gpu_opencl.obj %OBJ%\core\gpu_cuda.obj
+set CORE=%OBJ%\core\mp4.obj %OBJ%\core\export360.obj %OBJ%\core\source360.obj %OBJ%\core\decoder.obj %OBJ%\core\reproject.obj %OBJ%\core\engine.obj %OBJ%\core\log.obj %OBJ%\core\gpu_opencl.obj %OBJ%\core\gpu_cuda.obj
 
 cl %CFLAGS% tools\max2render.cpp %CORE% /Fo%OBJ%\ /Fe%OUT%\max2render.exe /link %LIBS% || exit /b 1
 
@@ -43,4 +44,15 @@ cl %CFLAGS% /c src\loader\loader.cpp /Fo%OBJ%\loader.obj || exit /b 1
 link /nologo /DLL /OUT:%BUNDLE%\Max2Reframe.ofx %OBJ%\loader.obj shell32.lib ole32.lib || exit /b 1
 rem "Prepare GoPro 360 for Resolve" in the Explorer folder menu (a window app, so no console flashes)
 cl %CFLAGS% /DUNICODE /D_UNICODE tools\prepare360.cpp /Fo%OBJ%\ /Fe%OUT%\Max2Prepare.exe /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib ole32.lib advapi32.lib || exit /b 1
-echo Built %OUT%\Max2ReframeCore.dll, %BUNDLE%\Max2Reframe.ofx and %OUT%\Max2Prepare.exe
+rem "Convert GoPro Reframe to Max2 Reframe" in the Explorer menu of .drt files, and its test program
+if not exist %OBJ%\zstddeclib.obj (
+  cl /nologo /O2 /MD /W1 /c third_party\zstd\zstddeclib.c /Fo%OBJ%\zstddeclib.obj || exit /b 1
+)
+set CONVERT=tools\convert\drt.cpp tools\convert\fusion.cpp tools\convert\gopro_view.cpp tools\convert\blob.cpp tools\convert\zip.cpp tools\convert\inflate.cpp
+cl %CFLAGS% /DUNICODE /D_UNICODE %CONVERT% /c /Fo%OBJ%\convert\ || exit /b 1
+set CONVERTOBJ=%OBJ%\convert\drt.obj %OBJ%\convert\fusion.obj %OBJ%\convert\gopro_view.obj %OBJ%\convert\blob.obj %OBJ%\convert\zip.obj %OBJ%\convert\inflate.obj %OBJ%\core\export360.obj %OBJ%\core\mp4.obj %OBJ%\zstddeclib.obj
+cl %CFLAGS% /DUNICODE /D_UNICODE tools\convert\max2convert.cpp %CONVERTOBJ% /Fo%OBJ%\convert\ /Fe%OUT%\Max2Convert.exe /link /SUBSYSTEM:WINDOWS user32.lib shell32.lib ole32.lib || exit /b 1
+cl %CFLAGS% tools\convert\convert_test.cpp %CONVERTOBJ% /Fo%OBJ%\convert\ /Fe%OUT%\convert_test.exe || exit /b 1
+rem Test host that runs another OpenFX plugin (GoPro Reframe) for tools\test\test_convert.py --pictures
+cl %CFLAGS% tools\test\ofxhost.cpp /Fo%OBJ%\ /Fe%OUT%\ofxhost.exe || exit /b 1
+echo Built %OUT%\Max2ReframeCore.dll, %BUNDLE%\Max2Reframe.ofx, %OUT%\Max2Prepare.exe and %OUT%\Max2Convert.exe
